@@ -1,0 +1,16 @@
+[application]
+name = "myphin"
+default_platform = "desktop"
+out_dir = "dist"
+asset_dir = "assets"
+
+[web.app]
+title = "Myphin"
+
+[web.watcher]
+reload_html = true
+watch_path = ["src", "assets"]
+
+[bundle]
+identifier = "me.faulk.myphin"
+icon = ["assets/icon.icns", "assets/icon.png"]

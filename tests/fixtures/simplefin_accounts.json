@@ -1,0 +1,41 @@
+{
+  "errlist": [
+    {
+      "code": "act.failed",
+      "msg": "<b>Failed</b> to get all transactions.",
+      "account_id": "2930002"
+    }
+  ],
+  "connections": [
+    {
+      "conn_id": "CON-1",
+      "name": "My Bank",
+      "org_id": "ORG-1",
+      "org_name": "Example Bank",
+      "org_url": "https://bank.example",
+      "sfin_url": "https://sfin.example.com"
+    }
+  ],
+  "accounts": [
+    {
+      "id": "2930002",
+      "name": "Checking",
+      "conn_id": "CON-1",
+      "currency": "USD",
+      "balance": "100.23",
+      "available-balance": "75.23",
+      "balance-date": 978366153,
+      "extra": { "routing": "hidden" },
+      "transactions": [
+        {
+          "id": "12394832938403",
+          "posted": 793090572,
+          "amount": "-33293.43",
+          "description": "Uncle Frank's Bait Shop",
+          "pending": false,
+          "extra": { "merchant_category": "5941" }
+        }
+      ]
+    }
+  ]
+}
