@@ -1,13 +1,15 @@
 use dioxus::prelude::*;
 
-use super::AI_BUSY;
+use super::{TraceExchange, AI_BUSY};
 use crate::ui::relative_time;
 use crate::ui::status::{push_status, StatusState};
 use crate::SharedStore;
 use myphin::ai::{self, AiSecret, AiSettings, AiTrace, Direction};
 use myphin::domain::Txn;
 use myphin::money::format_cents;
-use myphin::providers::{ReqwestTransport, SimpleFinSource, TransactionSource};
+use myphin::providers::{
+    parse_root_certificate, url_allowed, ReqwestTransport, SimpleFinSource, TransactionSource,
+};
 use myphin::sync::{default_history_window, sync_connection};
 use myphin::TxnQuery;
 
@@ -17,16 +19,19 @@ enum Tab {
     Ai,
     Debug,
     Log,
+    Appearance,
+    Passphrase,
 }
 
-/// Setup screen: bank connections, the AI categorizer, and the session log. Categories and
-/// rules have their own screen.
+/// Setup screen: bank connections, the AI categorizer, the session log, the theme,
+/// and the passphrase. Categories and rules have their own screen.
 #[component]
 pub fn SetupView(
     store: Signal<Option<SharedStore>>,
     nonce: Signal<u64>,
     status: Signal<StatusState>,
     syncing: Signal<Option<String>>,
+    theme: Signal<String>,
 ) -> Element {
     let mut tab = use_signal(|| Tab::Connections);
     let _ = nonce();
@@ -38,7 +43,7 @@ pub fn SetupView(
     rsx! {
         div { class: "setup",
             nav { class: "subnav", aria_label: "Setup sections",
-                for (t, label) in [(Tab::Connections, "Connections"), (Tab::Ai, "AI"), (Tab::Debug, "Debug"), (Tab::Log, "Log")] {
+                for (t, label) in [(Tab::Connections, "Connections"), (Tab::Ai, "AI"), (Tab::Debug, "Debug"), (Tab::Log, "Log"), (Tab::Appearance, "Appearance"), (Tab::Passphrase, "Passphrase")] {
                     button {
                         class: if tab() == t { "sub on" } else { "sub" },
                         onclick: move |_| tab.set(t),
@@ -54,6 +59,8 @@ pub fn SetupView(
                 Tab::Ai => rsx! { AiSetup { store, nonce, status, syncing } },
                 Tab::Debug => rsx! { DebugSetup { store, nonce, status } },
                 Tab::Log => rsx! { StatusLog { store, status, nonce } },
+                Tab::Appearance => rsx! { Appearance { store, nonce, status, theme } },
+                Tab::Passphrase => rsx! { Passphrase { store, status } },
             }
         }
     }
@@ -287,17 +294,29 @@ fn AiSetup(
             .unwrap_or_else(|| ai::PROVIDERS[0].provider_id().to_string())
     });
     let mut key = use_signal(String::new);
+    let mut endpoint = use_signal(|| saved.endpoint.clone().unwrap_or_default());
+    let mut ca_cert = use_signal(|| saved.ca_cert.clone().unwrap_or_default());
     let mut threshold = use_signal(|| format!("{}", (saved.threshold * 100.0).round() as i64));
     let mut after_sync = use_signal(|| saved.after_sync);
     let has_key = !saved.api_key.is_empty();
+    let configured = saved.is_configured();
     let saved_key = saved.api_key.clone();
     let busy = syncing().is_some();
     let uncategorized = store()
         .and_then(|s| s.lock().ok().and_then(|g| g.uncategorized_count().ok()))
         .unwrap_or(0);
-    let key_help = ai::categorizer_for(&provider())
-        .map(|p| p.key_help())
-        .unwrap_or("");
+    let selected = ai::categorizer_for(&provider());
+    let key_help = selected.map(|p| p.key_help()).unwrap_or("");
+    let needs_key = selected.map(|p| p.needs_key()).unwrap_or(true);
+    let key_label = if needs_key {
+        "API key"
+    } else {
+        "API key (optional)"
+    };
+    let description = selected.map(|p| p.description()).unwrap_or("");
+    let warning = selected.and_then(|p| p.warning());
+    let link = selected.and_then(|p| p.link());
+    let default_endpoint = selected.and_then(|p| p.default_endpoint());
 
     let save = move |_| {
         let Some(s) = store() else {
@@ -317,9 +336,34 @@ fn AiSetup(
         } else {
             AiSecret(typed)
         };
+        // The URL and certificate only mean something for a self-hosted provider; the fields
+        // are hidden for the others and their values are not saved.
+        let (endpoint, ca_cert) = if default_endpoint.is_some() {
+            let url = endpoint.read().trim().trim_end_matches('/').to_string();
+            if !url.is_empty() && !url_allowed(&url) {
+                push_status(
+                    status,
+                    "Server URL must be https, or http on a local network address.",
+                );
+                return;
+            }
+            let pem = ca_cert.read().trim().to_string();
+            if !pem.is_empty() && parse_root_certificate(&pem).is_none() {
+                push_status(status, "Server certificate is not valid PEM.");
+                return;
+            }
+            (
+                (!url.is_empty()).then_some(url),
+                (!pem.is_empty()).then_some(pem),
+            )
+        } else {
+            (None, None)
+        };
         let settings = AiSettings {
             provider: Some(provider()),
             api_key,
+            endpoint,
+            ca_cert,
             threshold: pct / 100.0,
             after_sync: after_sync(),
         };
@@ -352,7 +396,46 @@ fn AiSetup(
                         option { value: "{p.provider_id()}", selected: provider() == p.provider_id(), "{p.label()}" }
                     }
                 }
-                label { r#for: "ai-key", "API key" }
+                if !description.is_empty() {
+                    p { class: "hint",
+                        "{description}"
+                        if let Some((text, url)) = link {
+                            " "
+                            a { href: "{url}", "{text}" }
+                        }
+                    }
+                }
+                if let Some(warning) = warning {
+                    p { class: "hint warn", "{warning}" }
+                }
+                if let Some(default_url) = default_endpoint {
+                    label { r#for: "ai-endpoint", "Server URL" }
+                    input {
+                        id: "ai-endpoint",
+                        r#type: "url",
+                        value: "{endpoint}",
+                        oninput: move |e| endpoint.set(e.value()),
+                        placeholder: "{default_url}",
+                        autocomplete: "off",
+                        spellcheck: "false",
+                    }
+                    p { class: "hint",
+                        "Leave blank for {default_url} on this machine. For a server elsewhere, use https, or http on a local network address."
+                    }
+                    label { r#for: "ai-ca-cert", "Server certificate (PEM, optional)" }
+                    textarea {
+                        id: "ai-ca-cert",
+                        rows: "4",
+                        value: "{ca_cert}",
+                        oninput: move |e| ca_cert.set(e.value()),
+                        placeholder: "-----BEGIN CERTIFICATE-----",
+                        spellcheck: "false",
+                    }
+                    p { class: "hint",
+                        "Only for a self-signed https server: paste its cert.pem here and it is trusted for this server alone."
+                    }
+                }
+                label { r#for: "ai-key", "{key_label}" }
                 input {
                     id: "ai-key",
                     r#type: "password",
@@ -405,13 +488,13 @@ fn AiSetup(
                 div { class: "card-actions",
                     button {
                         class: "primary",
-                        disabled: busy || !has_key || uncategorized == 0,
+                        disabled: busy || !configured || uncategorized == 0,
                         onclick: run,
                         if syncing().as_deref() == Some(AI_BUSY) { "Asking…" } else { "Categorize with AI" }
                     }
                 }
             }
-            AiDebug { store, nonce, status, syncing, has_key }
+            AiDebug { store, nonce, status, syncing, configured }
         }
     }
 }
@@ -427,7 +510,7 @@ fn AiDebug(
     nonce: Signal<u64>,
     status: Signal<StatusState>,
     syncing: Signal<Option<String>>,
-    has_key: bool,
+    configured: bool,
 ) -> Element {
     let _ = nonce();
     let mut search = use_signal(String::new);
@@ -509,12 +592,12 @@ fn AiDebug(
             div { class: "row",
                 button {
                     class: "primary",
-                    disabled: busy() || syncing().is_some() || !has_key || !pick_ok,
+                    disabled: busy() || syncing().is_some() || !configured || !pick_ok,
                     onclick: send,
                     if busy() { "Asking…" } else { "Send to AI" }
                 }
-                if !has_key {
-                    span { class: "hint", "Save a key first." }
+                if !configured {
+                    span { class: "hint", "Finish AI setup first." }
                 }
             }
             if let Some(t) = trace() {
@@ -528,27 +611,17 @@ fn AiDebug(
                         }
                     }
                     for (i, x) in t.exchanges.iter().enumerate() {
-                        if t.exchanges.len() > 1 {
-                            p { class: "hint", "Attempt {i + 1}" }
+                        TraceExchange {
+                            key: "{i}",
+                            exchange: x.clone(),
+                            attempt: (t.exchanges.len() > 1).then_some(i + 1),
                         }
-                        h3 { "Request" span { class: "hint-inline", " {x.method} {x.url}" } }
-                        pre { "{x.request}" }
-                        h3 {
-                            "Response"
-                            span { class: "hint-inline",
-                                match x.status {
-                                    Some(code) => format!(" HTTP {code}"),
-                                    None => " no response (network error)".to_string(),
-                                }
-                            }
-                        }
-                        pre { if x.response.is_empty() { "(empty)" } else { "{x.response}" } }
                     }
                     if t.exchanges.is_empty() {
                         p { class: "hint", "No request was sent." }
                     }
                     p { class: "trace-result",
-                        "{debug_outcome(&t)}"
+                        "{t.outcome()}"
                     }
                 }
             }
@@ -566,23 +639,6 @@ fn debug_pick_label(t: &Txn) -> String {
         s.push_str(&format!(" · {c}"));
     }
     s
-}
-
-/// One line summing up what the provider answered, or why it did not.
-fn debug_outcome(t: &AiTrace) -> String {
-    if let Some(e) = &t.error {
-        return format!("Failed: {e}");
-    }
-    match &t.guess {
-        Some(g) => {
-            let pct = (g.confidence * 100.0).round() as i64;
-            match &t.category_name {
-                Some(name) => format!("Picked {name} at {pct}% confidence."),
-                None => format!("Picked other (nothing fits) at {pct}% confidence."),
-            }
-        }
-        None => "No answer.".to_string(),
-    }
 }
 
 /// Kick off an AI pass from the UI thread. `ids` limits it to those rows (one row, or the rows
@@ -706,6 +762,246 @@ fn DebugSetup(
             }
         }
     }
+}
+
+/// Appearance: the ledger's theme, the screen it opens on, and Activity's opening chip.
+#[component]
+fn Appearance(
+    store: Signal<Option<SharedStore>>,
+    nonce: Signal<u64>,
+    status: Signal<StatusState>,
+    mut theme: Signal<String>,
+) -> Element {
+    let _ = nonce();
+    let current = store()
+        .and_then(|s| s.lock().ok().and_then(|g| g.theme().ok()))
+        .unwrap_or_else(|| myphin::store::DEFAULT_THEME.to_string());
+    let save = move |e: Event<FormData>| {
+        let id = e.value();
+        let Some(s) = store() else {
+            push_status(status, "Locked");
+            return;
+        };
+        let label = myphin::store::THEMES
+            .iter()
+            .find(|(k, _)| *k == id)
+            .map(|(_, name)| *name)
+            .unwrap_or("Ledger");
+        match s.lock().unwrap().set_theme(&id) {
+            Ok(()) => {
+                theme.set(id);
+                push_status(status, format!("Theme set to {label}."));
+            }
+            Err(err) => push_status(status, err.as_user_message()),
+        }
+        super::bump(nonce);
+    };
+    let open_on = store()
+        .and_then(|s| s.lock().ok().and_then(|g| g.open_screen().ok()))
+        .unwrap_or_else(|| myphin::store::DEFAULT_OPEN_SCREEN.to_string());
+    let activity_on = store()
+        .and_then(|s| s.lock().ok().and_then(|g| g.activity_scope().ok()))
+        .unwrap_or_else(|| myphin::store::DEFAULT_ACTIVITY_SCOPE.to_string());
+    let save_open = move |e: Event<FormData>| {
+        save_choice(
+            store,
+            status,
+            nonce,
+            e.value(),
+            myphin::store::OPEN_SCREENS,
+            |s, id| s.set_open_screen(id),
+            |label| format!("This ledger will open on {label}."),
+        );
+    };
+    let save_scope = move |e: Event<FormData>| {
+        save_choice(
+            store,
+            status,
+            nonce,
+            e.value(),
+            myphin::store::ACTIVITY_SCOPES,
+            |s, id| s.set_activity_scope(id),
+            |label| format!("Activity will open on {label}."),
+        );
+    };
+    rsx! {
+        section {
+            h2 { "Appearance" }
+            p { class: "lede",
+                "The look of this ledger. It stays with the folder, and locking keeps the last choice until the app closes."
+            }
+            div { class: "card form",
+                label { r#for: "theme", "Theme" }
+                select {
+                    id: "theme",
+                    value: "{current}",
+                    onchange: save,
+                    for (id, label) in myphin::store::THEMES {
+                        option { key: "{id}", value: "{id}", selected: current == *id, "{label}" }
+                    }
+                }
+            }
+            div { class: "card form",
+                label { r#for: "open-screen", "Open on" }
+                select {
+                    id: "open-screen",
+                    value: "{open_on}",
+                    onchange: save_open,
+                    for (id, label) in myphin::store::OPEN_SCREENS {
+                        option { key: "{id}", value: "{id}", selected: open_on == *id, "{label}" }
+                    }
+                }
+                p { class: "hint", "Used the next time this ledger unlocks." }
+                label { r#for: "activity-scope", "Activity opens on" }
+                select {
+                    id: "activity-scope",
+                    value: "{activity_on}",
+                    onchange: save_scope,
+                    for (id, label) in myphin::store::ACTIVITY_SCOPES {
+                        option { key: "{id}", value: "{id}", selected: activity_on == *id, "{label}" }
+                    }
+                }
+                p { class: "hint", "The chip Activity starts on, and what Reset returns to." }
+            }
+        }
+    }
+}
+
+/// Change the passphrase that encrypts this ledger. The previous file stays until the next unlock.
+#[component]
+fn Passphrase(store: Signal<Option<SharedStore>>, status: Signal<StatusState>) -> Element {
+    let mut current = use_signal(String::new);
+    let mut new_pass = use_signal(String::new);
+    let mut confirm = use_signal(String::new);
+
+    rsx! {
+        section {
+            h2 { "Passphrase" }
+            p { class: "lede",
+                "Re-encrypts this ledger. A copy under the current passphrase stays in the data folder until you unlock with the new one. A forgotten passphrase still cannot be recovered."
+            }
+            div { class: "card form",
+                label { r#for: "pass-current", "Current passphrase" }
+                input {
+                    id: "pass-current",
+                    r#type: "password",
+                    value: "{current}",
+                    autocomplete: "current-password",
+                    spellcheck: "false",
+                    oninput: move |e| current.set(e.value()),
+                    onkeydown: move |e| {
+                        if e.key() == Key::Enter {
+                            apply_passphrase(store, status, current, new_pass, confirm);
+                        }
+                    },
+                }
+                label { r#for: "pass-new", "New passphrase" }
+                input {
+                    id: "pass-new",
+                    r#type: "password",
+                    value: "{new_pass}",
+                    autocomplete: "new-password",
+                    spellcheck: "false",
+                    oninput: move |e| new_pass.set(e.value()),
+                    onkeydown: move |e| {
+                        if e.key() == Key::Enter {
+                            apply_passphrase(store, status, current, new_pass, confirm);
+                        }
+                    },
+                }
+                label { r#for: "pass-confirm", "Confirm new passphrase" }
+                input {
+                    id: "pass-confirm",
+                    r#type: "password",
+                    value: "{confirm}",
+                    autocomplete: "new-password",
+                    spellcheck: "false",
+                    oninput: move |e| confirm.set(e.value()),
+                    onkeydown: move |e| {
+                        if e.key() == Key::Enter {
+                            apply_passphrase(store, status, current, new_pass, confirm);
+                        }
+                    },
+                }
+                div { class: "row",
+                    button {
+                        class: "primary",
+                        onclick: move |_| {
+                            apply_passphrase(store, status, current, new_pass, confirm);
+                        },
+                        "Change passphrase"
+                    }
+                }
+                p { class: "hint",
+                    "The copy is {myphin::store::LEDGER_BACKUP}. If the new passphrase will not unlock, quit, replace ledger.enc with that file, and use the previous passphrase."
+                }
+            }
+        }
+    }
+}
+
+/// Check the two new fields, then re-encrypt. Clears the form only after a successful change.
+fn apply_passphrase(
+    store: Signal<Option<SharedStore>>,
+    status: Signal<StatusState>,
+    mut current: Signal<String>,
+    mut new_pass: Signal<String>,
+    mut confirm: Signal<String>,
+) {
+    let Some(s) = store() else {
+        push_status(status, "Locked");
+        return;
+    };
+    // Copy the strings out so the signal borrows end before the fields are cleared.
+    let current_pass = current.read().clone();
+    let next = new_pass.read().clone();
+    let again = confirm.read().clone();
+    if next != again {
+        push_status(status, "Those passphrases do not match.");
+        return;
+    }
+    let result = s.lock().unwrap().change_passphrase(&current_pass, &next);
+    match result {
+        Ok(()) => {
+            current.set(String::new());
+            new_pass.set(String::new());
+            confirm.set(String::new());
+            push_status(
+                    status,
+                    format!(
+                        "Passphrase changed. {} will be removed the next time you unlock with the new passphrase.",
+                        myphin::store::LEDGER_BACKUP
+                    ),
+                );
+        }
+        Err(err) => push_status(status, err.as_user_message()),
+    }
+}
+
+/// Save one of the opening choices and toast its label.
+fn save_choice(
+    store: Signal<Option<SharedStore>>,
+    status: Signal<StatusState>,
+    nonce: Signal<u64>,
+    id: String,
+    choices: &[(&str, &str)],
+    write: impl FnOnce(&myphin::Store, &str) -> Result<(), myphin::Error>,
+    toast: impl FnOnce(&str) -> String,
+) {
+    let Some(s) = store() else {
+        push_status(status, "Locked");
+        return;
+    };
+    let label = choices
+        .iter()
+        .find(|(k, _)| *k == id)
+        .map(|(_, name)| *name)
+        .unwrap_or("that");
+    match write(&s.lock().unwrap(), &id) {
+        Ok(()) => push_status(status, toast(label)),
+        Err(err) => push_status(status, err.as_user_message()),
+    }
+    super::bump(nonce);
 }
 
 #[component]

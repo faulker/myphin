@@ -4,7 +4,58 @@ mod simplefin;
 
 pub use simplefin::{MapTransport, ScriptedTransport, SimpleFinSource};
 
+use std::time::Duration;
+
+use url::Url;
+
 use crate::error::Error;
+
+/// reqwest's blocking client default. Used when `TransportRequest::timeout` is `None`.
+pub const DEFAULT_REQUEST_TIMEOUT: Duration = Duration::from_secs(30);
+/// User-facing text `ReqwestTransport` returns on a client timeout, so callers can remap it.
+pub const TRANSPORT_TIMEOUT_MSG: &str = "The request timed out.";
+
+/// Whether a URL is safe for a provider request: any `https://` URL, or `http://` to a host
+/// that cannot be reached from the public internet (loopback, RFC 1918 and link-local
+/// addresses, IPv6 unique-local, single-label hostnames, and `.local` / `.lan` / `.home` /
+/// `.internal` / `.home.arpa` names), for a self-hosted model server such as `lmr-rs`.
+/// Rejects lookalikes like `http://127.0.0.1.evil.com`.
+pub fn url_allowed(url: &str) -> bool {
+    let Ok(parsed) = Url::parse(url) else {
+        return false;
+    };
+    match parsed.scheme() {
+        "https" => true,
+        "http" => match parsed.host() {
+            Some(url::Host::Ipv4(ip)) => ip.is_loopback() || ip.is_private() || ip.is_link_local(),
+            Some(url::Host::Ipv6(ip)) => {
+                ip.is_loopback() || ip.is_unique_local() || ip.is_unicast_link_local()
+            }
+            Some(url::Host::Domain(host)) => is_private_hostname(host),
+            None => false,
+        },
+        _ => false,
+    }
+}
+
+/// Parse a PEM certificate for use as an extra trusted root. `None` when it is not valid PEM.
+pub fn parse_root_certificate(pem: &str) -> Option<reqwest::Certificate> {
+    reqwest::Certificate::from_pem(pem.trim().as_bytes()).ok()
+}
+
+/// Hostnames that only resolve on a local network.
+fn is_private_hostname(host: &str) -> bool {
+    let host = host.trim_end_matches('.').to_ascii_lowercase();
+    if host.is_empty() {
+        return false;
+    }
+    if host == "localhost" || !host.contains('.') {
+        return true;
+    }
+    [".local", ".lan", ".home", ".internal", ".home.arpa"]
+        .iter()
+        .any(|suffix| host.ends_with(suffix))
+}
 
 /// Inclusive start / exclusive end, unix seconds.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -80,6 +131,13 @@ pub struct TransportRequest {
     pub headers: Vec<(String, String)>,
     /// JSON body for POSTs. `None` sends an empty body.
     pub body: Option<Vec<u8>>,
+    /// Extra trusted root certificate (PEM) for this request only, for a self-hosted server
+    /// with a self-signed certificate. Never logged.
+    pub root_cert_pem: Option<String>,
+    /// Whole-request timeout, including the response body. `None` uses
+    /// [`DEFAULT_REQUEST_TIMEOUT`] (reqwest's 30s blocking default). Local model inference
+    /// needs longer than that.
+    pub timeout: Option<Duration>,
 }
 
 impl Default for TransportRequest {
@@ -93,11 +151,13 @@ impl Default for TransportRequest {
             follow_redirects: false,
             headers: vec![],
             body: None,
+            root_cert_pem: None,
+            timeout: None,
         }
     }
 }
 
-#[derive(Clone)]
+#[derive(Clone, Debug)]
 pub struct TransportResponse {
     pub status: u16,
     pub body: Vec<u8>,
@@ -136,17 +196,30 @@ impl ReqwestTransport {
 
 impl Transport for ReqwestTransport {
     fn send(&self, req: &TransportRequest) -> Result<TransportResponse, Error> {
-        if !req.url.starts_with("https://") {
+        if !url_allowed(&req.url) {
             return Err(Error::user("Refusing non-HTTPS URL."));
         }
-        let client = reqwest::blocking::Client::builder()
+        let private_http = req.url.starts_with("http://");
+        let mut builder = reqwest::blocking::Client::builder()
             .use_rustls_tls()
-            .https_only(true)
+            .https_only(!private_http)
+            .timeout(req.timeout.unwrap_or(DEFAULT_REQUEST_TIMEOUT))
             .redirect(if req.follow_redirects {
                 reqwest::redirect::Policy::limited(10)
             } else {
                 reqwest::redirect::Policy::none()
-            })
+            });
+        if let Some(pem) = req
+            .root_cert_pem
+            .as_deref()
+            .map(str::trim)
+            .filter(|p| !p.is_empty())
+        {
+            let cert = parse_root_certificate(pem)
+                .ok_or_else(|| Error::user("Server certificate is not valid PEM."))?;
+            builder = builder.add_root_certificate(cert);
+        }
+        let client = builder
             .build()
             .map_err(|_| Error::Internal(crate::error::InternalError::Http))?;
         let mut builder = match (req.method, &req.body) {
@@ -169,9 +242,13 @@ impl Transport for ReqwestTransport {
         for (k, v) in &req.query {
             builder = builder.query(&[(k, v)]);
         }
-        let resp = builder
-            .send()
-            .map_err(|_| Error::user("Network error talking to the remote service."))?;
+        let resp = builder.send().map_err(|e| {
+            if e.is_timeout() {
+                Error::user(TRANSPORT_TIMEOUT_MSG)
+            } else {
+                Error::user("Network error talking to the remote service.")
+            }
+        })?;
         let status = resp.status().as_u16();
         let body = resp
             .bytes()
@@ -232,6 +309,47 @@ mod tests {
     }
 
     #[test]
+    fn url_allowed_accepts_https_and_private_http() {
+        assert!(url_allowed("http://127.0.0.1:8321/x"));
+        assert!(url_allowed("http://localhost/x"));
+        assert!(url_allowed("http://[::1]:8321/x"));
+        assert!(url_allowed("https://api.example.com"));
+        for host in [
+            "10.0.0.5",
+            "172.16.4.2",
+            "192.168.1.20:8321",
+            "169.254.1.1",
+            "[fd00::1]",
+            "[fe80::1]",
+        ] {
+            assert!(url_allowed(&format!("http://{host}/x")), "{host}");
+        }
+        for host in [
+            "nas",
+            "laya.local",
+            "laya.lan",
+            "server.home",
+            "box.internal",
+            "pi.home.arpa",
+            "NAS.Local.",
+        ] {
+            assert!(url_allowed(&format!("http://{host}:8321/x")), "{host}");
+        }
+    }
+
+    #[test]
+    fn url_allowed_rejects_public_http_and_other_schemes() {
+        assert!(!url_allowed("http://example.com"));
+        assert!(!url_allowed("http://127.0.0.1.evil.com"));
+        assert!(!url_allowed("http://8.8.8.8/x"));
+        assert!(!url_allowed("http://172.32.0.1/x"));
+        assert!(!url_allowed("http://[2001:db8::1]/x"));
+        assert!(!url_allowed("http://laya.local.example.com/x"));
+        assert!(!url_allowed("ftp://127.0.0.1/x"));
+        assert!(!url_allowed("not a url"));
+    }
+
+    #[test]
     fn ninety_day_history_fits_recommended_chunks() {
         let start = 0;
         let end = 90 * 86400;
@@ -241,5 +359,24 @@ mod tests {
             assert!(win.end_date - win.start_date <= MAX_WINDOW_DAYS * 86400);
         }
         assert_eq!(w.last().unwrap().end_date, end);
+    }
+
+    #[test]
+    fn request_timeout_is_reported_as_user_error() {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+        let t = ReqwestTransport::new().unwrap();
+        let err = t
+            .send(&TransportRequest {
+                method: "POST",
+                url: format!("http://{addr}/v1/systemone"),
+                body: Some(b"{}".to_vec()),
+                timeout: Some(Duration::from_millis(200)),
+                ..Default::default()
+            })
+            .unwrap_err();
+        assert_eq!(err.as_user_message(), TRANSPORT_TIMEOUT_MSG);
+        // Keep the listener alive until the client gives up, so the port stays bound.
+        drop(listener);
     }
 }

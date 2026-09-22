@@ -1,6 +1,7 @@
-/* Myphin: dark editorial ledger. Warm near-black, cream ink, one gold accent. */
+/* Myphin: editorial ledger. Ledger is the default; Ink, Paper, and Newsprint override it. */
 
 :root {
+  color-scheme: dark;
   --bg: #14110f;
   --bg-2: #1c1814;
   --bg-3: #241e18;
@@ -12,7 +13,13 @@
   --accent-ink: #1a140c;
   --danger: #e06b4f;
   --in: #8fbe8b;
+  --pace-under: #8fbe8b;
+  --pace-mid: #e0a14a;
+  --pace-near: #c46a2e;
+  --pace-over: #e06b4f;
   --focus: #f0d7a4;
+  --sel: rgb(224 161 74 / 0.12);
+  --shadow: 0 12px 28px rgb(8 6 4 / 0.5);
   --serif: "Iowan Old Style", "Palatino Linotype", Palatino, "Times New Roman", serif;
   --mono: "IBM Plex Mono", ui-monospace, Menlo, monospace;
   --s1: 0.25rem;
@@ -22,6 +29,90 @@
   --s5: 1.5rem;
   --s6: 2.25rem;
   --radius: 3px;
+}
+
+/* Ink: cool blue-black, pale paper ink, copper. */
+[data-theme="ink"] {
+  color-scheme: dark;
+  --bg: #10141a;
+  --bg-2: #181e26;
+  --bg-3: #212833;
+  --ink: #e6e4dc;
+  --muted: #9aa3ae;
+  --faint: #6c7682;
+  --line: #343d4a;
+  --accent: #d4896a;
+  --accent-ink: #1a120e;
+  --danger: #e07a68;
+  --in: #7dba96;
+  --pace-under: #6eaea0;
+  --pace-mid: #8aa4b8;
+  --pace-near: #d4896a;
+  --pace-over: #e07a8a;
+  --focus: #e7c4b0;
+  --sel: rgb(212 137 106 / 0.14);
+  --shadow: 0 12px 28px rgb(4 6 10 / 0.55);
+}
+
+/* Paper: warm ivory, dark brown ink, a darker gold. */
+[data-theme="paper"] {
+  color-scheme: light;
+  --bg: #f4efe6;
+  --bg-2: #ebe4d6;
+  --bg-3: #e2d8c6;
+  --ink: #1c1612;
+  --muted: #6b5e50;
+  --faint: #8f8272;
+  --line: #d2c6b2;
+  --accent: #8f5a16;
+  --accent-ink: #fff8ee;
+  --danger: #a33b28;
+  --in: #1f6b3a;
+  --pace-under: #1f6b3a;
+  --pace-mid: #8f5a16;
+  --pace-near: #7a3e1c;
+  --pace-over: #a33b28;
+  --focus: #6e4510;
+  --sel: rgb(143 90 22 / 0.12);
+  --shadow: 0 12px 28px rgb(40 28 12 / 0.16);
+}
+
+/* Newsprint: cool gray paper, near-black ink, indigo. */
+[data-theme="newsprint"] {
+  color-scheme: light;
+  --bg: #f2f1ee;
+  --bg-2: #e6e5e1;
+  --bg-3: #dad9d4;
+  --ink: #1a1c1e;
+  --muted: #5c6166;
+  --faint: #848b92;
+  --line: #cdc9c2;
+  --accent: #2c4a6e;
+  --accent-ink: #f4f7fb;
+  --danger: #9c342c;
+  --in: #1a6840;
+  --pace-under: #1a6840;
+  --pace-mid: #2c4a6e;
+  --pace-near: #6a5344;
+  --pace-over: #9c342c;
+  --focus: #1e3a5c;
+  --sel: rgb(44 74 110 / 0.1);
+  --shadow: 0 12px 28px rgb(20 22 26 / 0.14);
+}
+
+/* The theme attribute sits on the app wrapper. These keep the page behind it, and native
+   scrollbars, on the same palette. Ledger is :root, so it needs no rule here. */
+html:has([data-theme="ink"]) {
+  color-scheme: dark;
+  background: #10141a;
+}
+html:has([data-theme="paper"]) {
+  color-scheme: light;
+  background: #f4efe6;
+}
+html:has([data-theme="newsprint"]) {
+  color-scheme: light;
+  background: #f2f1ee;
 }
 
 * { box-sizing: border-box; }
@@ -132,6 +223,7 @@ label { color: var(--muted); font-size: 0.85rem; }
 .spacer { flex: 1; }
 .hint, .hint-inline { color: var(--muted); font-size: 0.82rem; }
 .hint { margin: var(--s2) 0; }
+.hint.warn { color: var(--accent); }
 .lede { color: var(--muted); margin: 0 0 var(--s2); }
 .err { color: var(--danger); margin: var(--s1) 0; font-size: 0.9rem; overflow-wrap: anywhere; }
 .empty { color: var(--muted); font-style: italic; margin: var(--s3) 0; }
@@ -151,6 +243,7 @@ label { color: var(--muted); font-size: 0.85rem; }
 
 /* Shell */
 
+.app { min-height: 100vh; background: var(--bg); color: var(--ink); }
 .shell { min-height: 100vh; display: flex; flex-direction: column; }
 .top {
   display: flex;
@@ -194,7 +287,7 @@ label { color: var(--muted); font-size: 0.85rem; }
   border: 1px solid var(--line);
   border-left: 3px solid var(--accent);
   border-radius: var(--radius);
-  box-shadow: 0 12px 28px rgba(8, 6, 4, 0.5);
+  box-shadow: var(--shadow);
   overflow: hidden;
   animation: toast-in 180ms ease-out;
 }
@@ -279,11 +372,16 @@ label { color: var(--muted); font-size: 0.85rem; }
 .cap-nums { grid-area: nums; font-family: var(--mono); font-size: 0.88rem; }
 .cap-nums .sep, .cap-nums .cap { color: var(--muted); }
 .cap-left { grid-area: left; font-size: 0.8rem; color: var(--muted); min-width: 7rem; text-align: right; }
-.over .cap-left, .over .spent { color: var(--danger); }
+.under .cap-left { color: var(--pace-under); }
+.mid .cap-left { color: var(--pace-mid); }
+.near .cap-left { color: var(--pace-near); }
+.over .cap-left, .over .spent { color: var(--pace-over); }
 .uncapped .cap-name { color: var(--muted); }
-.bar { grid-area: bar; display: block; height: 4px; background: var(--line); border-radius: 2px; overflow: hidden; }
-.fill { display: block; height: 100%; background: var(--accent); }
-.over .fill { background: var(--danger); }
+.bar { grid-area: bar; display: block; height: 8px; background: var(--line); border-radius: 4px; overflow: hidden; }
+.fill { display: block; height: 100%; background: var(--pace-under); }
+.mid .fill { background: var(--pace-mid); }
+.near .fill { background: var(--pace-near); }
+.over .fill { background: var(--pace-over); }
 .uncapped .bar { visibility: hidden; }
 
 /* Activity */
@@ -332,7 +430,7 @@ label { color: var(--muted); font-size: 0.85rem; }
   gap: var(--s2);
   align-items: center;
   flex-wrap: wrap;
-  box-shadow: 0 12px 28px rgba(8, 6, 4, 0.5);
+  box-shadow: var(--shadow);
 }
 /* Leave room so the floating bar doesn't hide the last rows. */
 .activity:has(.bulk) .txns { padding-bottom: 4rem; }
@@ -372,7 +470,7 @@ label { color: var(--muted); font-size: 0.85rem; }
   background: var(--muted);
 }
 .txn.sel .txn-main::before { background: var(--accent); width: 3px; }
-.txn.sel .txn-main { background: rgba(224, 161, 74, 0.07); }
+.txn.sel .txn-main { background: var(--sel); }
 .txn.ex .payee-name { text-decoration: line-through; color: var(--muted); }
 .cur-mark { position: absolute; inset: 0; pointer-events: none; }
 .pick { justify-self: start; width: 1.25rem; height: 1.25rem; cursor: pointer; }
@@ -475,6 +573,15 @@ button.sub.on { color: var(--ink); box-shadow: inset 0 -2px 0 var(--accent); }
 .card-actions .hint { margin: 0; }
 .trace { display: flex; flex-direction: column; gap: var(--s2); margin-top: var(--s2); }
 .trace h3 { margin: var(--s2) 0 0; font-size: 0.95rem; }
+.trace-field { position: relative; }
+.trace-copy {
+  position: absolute;
+  top: var(--s2);
+  right: var(--s2);
+  z-index: 1;
+  background: var(--bg);
+}
+.trace-copy:hover { background: var(--bg-3); }
 .trace pre {
   margin: 0;
   padding: var(--s2) var(--s3);
@@ -489,6 +596,7 @@ button.sub.on { color: var(--ink); box-shadow: inset 0 -2px 0 var(--accent); }
   white-space: pre-wrap;
   word-break: break-word;
 }
+.trace-field pre { padding-right: 4.5rem; }
 .trace-result { margin: var(--s2) 0 0; }
 .conns { list-style: none; padding: 0; margin: 0; display: flex; flex-direction: column; gap: var(--s2); }
 .accts { list-style: none; padding: 0; margin: 0; display: flex; flex-direction: column; gap: var(--s1); }

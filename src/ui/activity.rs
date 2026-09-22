@@ -6,7 +6,7 @@ use crate::ui::rules::{
 };
 use crate::ui::setup::start_ai_run;
 use crate::ui::status::{push_status, push_undoable, StatusState, Undo};
-use crate::ui::{default_filter, month_label};
+use crate::ui::{activity_scope_query, month_label, TraceExchange};
 use crate::SharedStore;
 use myphin::domain::{match_category_typeahead, AiRecord, Category, Txn};
 use myphin::money::format_cents;
@@ -166,9 +166,12 @@ pub fn ActivityView(
     let mut anchor = use_signal(|| None::<(String, f64)>);
     let _tick = nonce();
 
-    let (txns, cats, accounts, months, ai_ready, debug) = match store() {
+    let (txns, cats, accounts, months, ai_ready, debug, home) = match store() {
         Some(s) => {
             let g = s.lock().unwrap();
+            let scope = g
+                .activity_scope()
+                .unwrap_or_else(|_| myphin::store::DEFAULT_ACTIVITY_SCOPE.to_string());
             (
                 g.query_transactions(&filter()).unwrap_or_default(),
                 g.list_categories().unwrap_or_default(),
@@ -176,6 +179,7 @@ pub fn ActivityView(
                 g.list_months().unwrap_or_default(),
                 g.ai_settings().map(|a| a.is_configured()).unwrap_or(false),
                 g.debug_enabled().unwrap_or(false),
+                activity_scope_query(&scope),
             )
         }
         None => {
@@ -192,7 +196,7 @@ pub fn ActivityView(
     let f = filter();
     let typed_now = typed();
     let hint = match_category_typeahead(&typed_now, &cats).map(|c| c.label());
-    let filtered = f != default_filter() && f != TxnQuery::default();
+    let off_home = f != home;
     let n_sel = selected.read().len();
     // The header checkbox reads as checked only when every row on screen is selected.
     let all_selected = !txns.is_empty()
@@ -580,10 +584,13 @@ pub fn ActivityView(
                         }
                     }
                 }
-                if filtered {
+                if off_home {
                     button {
                         class: "ghost small",
-                        onclick: move |_| set_filter(default_filter()),
+                        onclick: {
+                            let home = home.clone();
+                            move |_| set_filter(home.clone())
+                        },
                         "Reset"
                     }
                 }
@@ -731,36 +738,27 @@ pub fn ActivityView(
 
             if txns.is_empty() {
                 div { class: "empty-state",
-                    if f.uncategorized_only && !filtered {
+                    if f == activity_scope_query("uncategorized") {
                         p { "Everything is categorized." }
                         p { class: "hint",
                             "Sync in Setup to pull new transactions, or switch to All."
                         }
-                    } else if f.ai_only
-                        && f
-                            == (TxnQuery {
-                                ai_only: true,
-                                ..Default::default()
-                            })
-                    {
+                    } else if f == activity_scope_query("ai") {
                         p { "Nothing categorized by AI yet." }
                         p { class: "hint", "Set up a provider in Setup → AI, then run it." }
-                    } else if f.excluded_only
-                        && f
-                            == (TxnQuery {
-                                excluded_only: true,
-                                ..Default::default()
-                            })
-                    {
+                    } else if f == activity_scope_query("excluded") {
                         p { "Nothing is excluded." }
                         p { class: "hint",
                             "Exclude a row from its editor or with ⌘E, and it shows up here."
                         }
-                    } else if filtered {
+                    } else if off_home {
                         p { "Nothing matches these filters." }
                         button {
                             class: "ghost",
-                            onclick: move |_| set_filter(default_filter()),
+                            onclick: {
+                                let home = home.clone();
+                                move |_| set_filter(home.clone())
+                            },
                             "Reset filters"
                         }
                     } else {
@@ -1605,29 +1603,10 @@ fn AiTracePanel(store: Signal<Option<SharedStore>>, txn_id: String, nonce: Signa
                         }
                     }
                     for (i, x) in r.exchanges.iter().enumerate() {
-                        if r.exchanges.len() > 1 {
-                            p { class: "hint", "Attempt {i + 1}" }
-                        }
-                        h3 {
-                            "Request"
-                            span { class: "hint-inline", " {x.method} {x.url}" }
-                        }
-                        pre { "{x.request}" }
-                        h3 {
-                            "Response"
-                            span { class: "hint-inline",
-                                match x.status {
-                                    Some(code) => format!(" HTTP {code}"),
-                                    None => " no response (network error)".to_string(),
-                                }
-                            }
-                        }
-                        pre {
-                            if x.response.is_empty() {
-                                "(empty)"
-                            } else {
-                                "{x.response}"
-                            }
+                        TraceExchange {
+                            key: "{i}",
+                            exchange: x.clone(),
+                            attempt: (r.exchanges.len() > 1).then_some(i + 1),
                         }
                     }
                     if r.exchanges.is_empty() && r.error.is_none() {

@@ -536,6 +536,8 @@ mod tests {
             parent_name: None,
             in_budget: true,
             parent_in_budget: true,
+            send_to_ai: true,
+            parent_send_to_ai: true,
         }];
         let r = Rule::pattern(
             "*costco* | arco*",
@@ -566,6 +568,8 @@ mod tests {
             parent_name: None,
             in_budget: true,
             parent_in_budget: true,
+            send_to_ai: true,
+            parent_send_to_ai: true,
         }];
         let r = Rule::pattern("*arco*", RuleAction::Category, Some("gas".into()), 1);
         assert_eq!(rule_outcome(&r, &cats), "Gas");
@@ -579,6 +583,8 @@ mod tests {
             parent_name: Some("Gas".into()),
             in_budget: true,
             parent_in_budget: true,
+            send_to_ai: true,
+            parent_send_to_ai: true,
         });
         let r = Rule::pattern("*truck*", RuleAction::Category, Some("diesel".into()), 4);
         assert_eq!(rule_outcome(&r, &cats), "Gas › Diesel");

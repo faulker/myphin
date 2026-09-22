@@ -152,6 +152,11 @@ pub struct Category {
     pub in_budget: bool,
     /// The parent's flag, `true` at top level. A child under an off-budget parent is off too.
     pub parent_in_budget: bool,
+    /// This row's own flag. See `is_sent_to_ai` for the value that counts. Independent of
+    /// `in_budget`: a catch-all can stay in the budget but off the list the model sees.
+    pub send_to_ai: bool,
+    /// The parent's flag, `true` at top level. A child under a parent left off the list is off too.
+    pub parent_send_to_ai: bool,
 }
 
 impl Category {
@@ -166,6 +171,11 @@ impl Category {
     /// Whether spend here counts toward the budget: the row and its parent are both in.
     pub fn is_budgeted(&self) -> bool {
         self.in_budget && self.parent_in_budget
+    }
+
+    /// Whether the AI categorizer sees this category: the row and its parent are both on.
+    pub fn is_sent_to_ai(&self) -> bool {
+        self.send_to_ai && self.parent_send_to_ai
     }
 }
 
@@ -555,8 +565,8 @@ impl Store {
     }
 
     /// Put a category in or out of the budget. Off-budget rows keep taking transactions but
-    /// have no cap and never count toward the month's spent. A child can't be switched on
-    /// while its parent is off.
+    /// have no cap and never count toward the month's spent. Turning a parent off also
+    /// turns its sub-categories off, and a child can't be switched on while its parent is off.
     pub fn set_category_in_budget(&self, id: &str, on: bool) -> Result<(), Error> {
         let Some(parent) = self.category_parent(id)? else {
             return Err(Error::user("That category is gone."));
@@ -577,6 +587,47 @@ impl Store {
             "UPDATE categories SET in_budget=?2 WHERE id=?1",
             params![id, on as i64],
         )?;
+        if !on {
+            self.conn().execute(
+                "UPDATE categories SET in_budget=0 WHERE parent_id=?1",
+                params![id],
+            )?;
+        }
+        self.persist()?;
+        Ok(())
+    }
+
+    /// Include or omit a category from the option list sent to the AI categorizer. Changing
+    /// it clears cached answers, because the list the model saw changed. Turning a parent
+    /// off also turns its sub-categories off, and a child can't be switched on while its
+    /// parent is off.
+    pub fn set_category_send_to_ai(&self, id: &str, on: bool) -> Result<(), Error> {
+        let Some(parent) = self.category_parent(id)? else {
+            return Err(Error::user("That category is gone."));
+        };
+        if on {
+            if let Some(pid) = parent {
+                let parent_on: i64 = self.conn().query_row(
+                    "SELECT send_to_ai FROM categories WHERE id=?1",
+                    params![pid],
+                    |r| r.get(0),
+                )?;
+                if parent_on == 0 {
+                    return Err(Error::user("Turn on its parent first."));
+                }
+            }
+        }
+        self.conn().execute(
+            "UPDATE categories SET send_to_ai=?2 WHERE id=?1",
+            params![id, on as i64],
+        )?;
+        if !on {
+            self.conn().execute(
+                "UPDATE categories SET send_to_ai=0 WHERE parent_id=?1",
+                params![id],
+            )?;
+        }
+        self.clear_ai_answers()?;
         self.persist()?;
         Ok(())
     }
@@ -700,7 +751,7 @@ impl Store {
     pub fn list_categories(&self) -> Result<Vec<Category>, Error> {
         let mut stmt = self.conn().prepare(
             "SELECT c.id, c.name, c.description, c.parent_id, p.name, c.in_budget,
-                    COALESCE(p.in_budget, 1)
+                    COALESCE(p.in_budget, 1), c.send_to_ai, COALESCE(p.send_to_ai, 1)
              FROM categories c LEFT JOIN categories p ON p.id = c.parent_id
              ORDER BY COALESCE(p.sort_order, c.sort_order), COALESCE(p.name, c.name),
                       c.parent_id IS NOT NULL, c.sort_order, c.name",
@@ -714,6 +765,8 @@ impl Store {
                 parent_name: r.get(4)?,
                 in_budget: r.get::<_, i64>(5)? != 0,
                 parent_in_budget: r.get::<_, i64>(6)? != 0,
+                send_to_ai: r.get::<_, i64>(7)? != 0,
+                parent_send_to_ai: r.get::<_, i64>(8)? != 0,
             })
         })?;
         Ok(rows.filter_map(|r| r.ok()).collect())
@@ -2677,6 +2730,8 @@ mod tests {
                 parent_name: None,
                 in_budget: true,
                 parent_in_budget: true,
+                send_to_ai: true,
+                parent_send_to_ai: true,
             },
             Category {
                 id: "2".into(),
@@ -2686,6 +2741,8 @@ mod tests {
                 parent_name: None,
                 in_budget: true,
                 parent_in_budget: true,
+                send_to_ai: true,
+                parent_send_to_ai: true,
             },
             Category {
                 id: "3".into(),
@@ -2695,6 +2752,8 @@ mod tests {
                 parent_name: None,
                 in_budget: true,
                 parent_in_budget: true,
+                send_to_ai: true,
+                parent_send_to_ai: true,
             },
         ];
         assert_eq!(
@@ -2965,18 +3024,63 @@ mod tests {
         s.set_category_in_budget(&c, true).unwrap();
         assert_eq!(s.month_budget(y, m).unwrap()[1].cap_cents, 100);
 
-        // Turning the parent off takes the child with it, and the child can't come back alone.
+        // Turning the parent off unticks the child too, and the child can't come back alone.
         s.set_category_in_budget(&p, false).unwrap();
         let cats = s.list_categories().unwrap();
         let child = cats.iter().find(|cat| cat.id == c).unwrap();
-        assert!(child.in_budget && !child.parent_in_budget && !child.is_budgeted());
+        assert!(!child.in_budget && !child.parent_in_budget && !child.is_budgeted());
         assert!(s.month_budget(y, m).unwrap().iter().all(|r| !r.in_budget));
         assert!(s.set_category_in_budget(&c, true).is_err());
+        // Turning the parent back on leaves the child unticked.
         s.set_category_in_budget(&p, true).unwrap();
+        let rows = s.month_budget(y, m).unwrap();
+        assert!(rows[0].in_budget);
+        assert!(!rows[1].in_budget);
+        s.set_category_in_budget(&c, true).unwrap();
         assert!(s.month_budget(y, m).unwrap().iter().all(|r| r.in_budget));
         // The row still takes transactions and still shows in the list the AI sees.
         assert_eq!(s.list_categories().unwrap().len(), 2);
+        assert!(s.list_categories().unwrap().iter().all(|c| c.send_to_ai));
         assert!(s.set_category_in_budget("nope", false).is_err());
+    }
+
+    #[test]
+    fn send_to_ai_defaults_on_and_can_be_toggled() {
+        let (_d, s) = store();
+        let id = s.add_category("Other").unwrap();
+        assert!(s.list_categories().unwrap()[0].send_to_ai);
+        s.set_category_send_to_ai(&id, false).unwrap();
+        assert!(!s.list_categories().unwrap()[0].send_to_ai);
+        s.set_category_send_to_ai(&id, true).unwrap();
+        assert!(s.list_categories().unwrap()[0].send_to_ai);
+        assert!(s.set_category_send_to_ai("nope", false).is_err());
+        // Unticking a parent unticks its children. Turning the parent back on leaves them off.
+        let p = s.add_category("Investment").unwrap();
+        let fees = s.add_subcategory(&p, "Fees").unwrap();
+        let tax = s.add_subcategory(&p, "Tax").unwrap();
+        s.set_category_send_to_ai(&fees, false).unwrap();
+        s.set_category_send_to_ai(&p, false).unwrap();
+        let cats = s.list_categories().unwrap();
+        let parent = cats.iter().find(|cat| cat.id == p).unwrap();
+        let fees_row = cats.iter().find(|cat| cat.id == fees).unwrap();
+        let tax_row = cats.iter().find(|cat| cat.id == tax).unwrap();
+        assert!(!parent.send_to_ai && parent.parent_send_to_ai);
+        assert!(!fees_row.send_to_ai && !fees_row.parent_send_to_ai && !fees_row.is_sent_to_ai());
+        assert!(!tax_row.send_to_ai && !tax_row.is_sent_to_ai());
+        assert!(s.set_category_send_to_ai(&fees, true).is_err());
+        s.set_category_send_to_ai(&p, true).unwrap();
+        let cats = s.list_categories().unwrap();
+        assert!(cats.iter().find(|cat| cat.id == p).unwrap().is_sent_to_ai());
+        assert!(!cats.iter().find(|cat| cat.id == fees).unwrap().send_to_ai);
+        assert!(!cats.iter().find(|cat| cat.id == tax).unwrap().send_to_ai);
+        s.set_category_send_to_ai(&tax, true).unwrap();
+        assert!(s
+            .list_categories()
+            .unwrap()
+            .iter()
+            .find(|cat| cat.id == tax)
+            .unwrap()
+            .is_sent_to_ai());
     }
 
     #[test]

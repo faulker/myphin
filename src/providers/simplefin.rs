@@ -278,7 +278,7 @@ impl MapTransport {
 
 impl Transport for MapTransport {
     fn send(&self, req: &TransportRequest) -> Result<crate::providers::TransportResponse, Error> {
-        if !req.url.starts_with("https://") {
+        if !crate::providers::url_allowed(&req.url) {
             return Err(Error::user("Refusing non-HTTPS URL."));
         }
         self.last_urls.lock().unwrap().push(req.url.clone());
@@ -310,8 +310,14 @@ pub struct ScriptedTransport {
     pub requests: std::sync::Mutex<Vec<RecordedRequest>>,
 }
 
-/// What a `ScriptedTransport` saw: (url, headers, body).
-pub type RecordedRequest = (String, Vec<(String, String)>, Vec<u8>);
+/// What a `ScriptedTransport` saw: (url, headers, body, extra root certificate, timeout).
+pub type RecordedRequest = (
+    String,
+    Vec<(String, String)>,
+    Vec<u8>,
+    Option<String>,
+    Option<std::time::Duration>,
+);
 
 impl ScriptedTransport {
     pub fn new(responses: Vec<crate::providers::TransportResponse>) -> Self {
@@ -329,13 +335,15 @@ impl ScriptedTransport {
 
 impl Transport for ScriptedTransport {
     fn send(&self, req: &TransportRequest) -> Result<crate::providers::TransportResponse, Error> {
-        if !req.url.starts_with("https://") {
+        if !crate::providers::url_allowed(&req.url) {
             return Err(Error::user("Refusing non-HTTPS URL."));
         }
         self.requests.lock().unwrap().push((
             req.url.clone(),
             req.headers.clone(),
             req.body.clone().unwrap_or_default(),
+            req.root_cert_pem.clone(),
+            req.timeout,
         ));
         self.responses
             .lock()
@@ -379,14 +387,15 @@ mod tests {
         assert_eq!(s.send(&req).unwrap().body, b"a".to_vec());
         assert!(s.send(&req).is_err());
         assert_eq!(s.calls(), 2);
-        let reqs = s.requests.lock().unwrap();
-        assert_eq!(reqs[0].1[0].0, "Authorization");
+        assert_eq!(s.requests.lock().unwrap()[0].1[0].0, "Authorization");
+        // Public plain HTTP is refused before anything is recorded.
         assert!(s
             .send(&TransportRequest {
-                url: "http://x".into(),
+                url: "http://example.com".into(),
                 ..Default::default()
             })
             .is_err());
+        assert_eq!(s.calls(), 2);
     }
 
     fn b64(url: &str) -> String {

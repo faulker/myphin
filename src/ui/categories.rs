@@ -175,7 +175,7 @@ fn Categories(
                     }
                 }
             }
-            td { colspan: "4",
+            td { colspan: "5",
                 span { class: "hint", "Enter saves, Esc cancels." }
             }
             td { class: "actions",
@@ -236,6 +236,14 @@ fn Categories(
             super::bump(nonce);
         }
     };
+    let set_send_to_ai = move |id: String, on: bool| {
+        if let Some(s) = store() {
+            if let Err(e) = s.lock().unwrap().set_category_send_to_ai(&id, on) {
+                push_status(status, e.as_user_message());
+            }
+            super::bump(nonce);
+        }
+    };
 
     rsx! {
         section {
@@ -268,9 +276,9 @@ fn Categories(
                 if rows.is_empty() {
                     "Add a category below. A cap stays in place for every later month until you change it."
                 } else if capped == 0 {
-                    "Type a cap next to a category and press Enter. It applies from this month on. Leave it blank for no cap. Use the arrows to reorder. Untick In budget to keep a category out of caps and the month's spent."
+                    "Type a cap next to a category and press Enter. It applies from this month on. Leave it blank for no cap. Use the arrows to reorder. Untick In budget to keep a category out of caps and the month's spent. Untick Send to AI to keep it off the list the categorizer sees."
                 } else {
-                    "{capped} of {rows.len()} capped. Changes apply from this month on. Blank means no cap. Use the arrows to reorder. Untick In budget to keep a category out of caps and the month's spent."
+                    "{capped} of {rows.len()} capped. Changes apply from this month on. Blank means no cap. Use the arrows to reorder. Untick In budget to keep a category out of caps and the month's spent. Untick Send to AI to keep it off the list the categorizer sees."
                 }
             }
 
@@ -282,6 +290,7 @@ fn Categories(
                             th { "Category" }
                             th { "Description" }
                             th { class: "flag", "In budget" }
+                            th { class: "flag", "Send to AI" }
                             th { class: "num", "Cap" }
                             th { class: "num", "Spent" }
                             th { "" }
@@ -310,6 +319,8 @@ fn Categories(
                             let first = siblings.first() == Some(&id.as_str());
                             let last = siblings.last() == Some(&id.as_str());
                             let parent_off = cat.map(|c| !c.parent_in_budget).unwrap_or(false);
+                            let parent_ai_off = cat.map(|c| !c.parent_send_to_ai).unwrap_or(false);
+                            let send_to_ai = cat.map(|c| c.is_sent_to_ai()).unwrap_or(true);
                             let description = cat.and_then(|c| c.description.clone()).unwrap_or_default();
                             let mut class = String::from(if over { "over" } else { "" });
                             if is_child {
@@ -435,6 +446,19 @@ fn Categories(
                                             },
                                         }
                                     }
+                                    td { class: "flag",
+                                        input {
+                                            r#type: "checkbox",
+                                            aria_label: "Send {r.category_name} to AI",
+                                            title: if parent_ai_off { "Its parent is not sent to AI" } else { "Shown to the AI categorizer as an option" },
+                                            checked: send_to_ai,
+                                            disabled: parent_ai_off,
+                                            onchange: {
+                                                let id = id.clone();
+                                                move |e| set_send_to_ai(id.clone(), e.checked())
+                                            },
+                                        }
+                                    }
                                     td { class: "num",
                                         if r.in_budget {
                                             input {
@@ -552,7 +576,7 @@ fn Categories(
                         if adding() && new_parent() == TOP_LEVEL {
                             {add_input("New category, e.g. Groceries")}
                         } else {
-                            td { colspan: "7",
+                            td { colspan: "8",
                                 button {
                                     class: "ghost small add-cat",
                                     onclick: move |_| open_add(TOP_LEVEL.to_string()),

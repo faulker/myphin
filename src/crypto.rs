@@ -14,6 +14,17 @@ const NONCE_LEN: usize = 24;
 #[derive(Clone, zeroize::ZeroizeOnDrop)]
 pub struct DataKey(pub [u8; 32]);
 
+impl DataKey {
+    /// True when both keys match. Compares every byte so the match does not stop early.
+    pub fn same_as(&self, other: &Self) -> bool {
+        let mut diff = 0u8;
+        for (a, b) in self.0.iter().zip(other.0.iter()) {
+            diff |= a ^ b;
+        }
+        diff == 0
+    }
+}
+
 /// Derive a 32-byte key from passphrase + salt (Argon2id).
 pub fn derive_key(passphrase: &str, salt: &[u8; SALT_LEN]) -> Result<DataKey, Error> {
     let argon = Argon2::default();
@@ -114,5 +125,14 @@ mod tests {
     #[test]
     fn rejects_garbage() {
         assert!(decrypt("x", b"nope").is_err());
+    }
+
+    #[test]
+    fn key_compare_checks_every_byte() {
+        let a = DataKey([1u8; 32]);
+        let mut b = DataKey([1u8; 32]);
+        assert!(a.same_as(&b));
+        b.0[31] = 2;
+        assert!(!a.same_as(&b));
     }
 }

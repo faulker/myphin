@@ -7,17 +7,52 @@ use rand::RngCore;
 use rusqlite::{params, Connection, OptionalExtension};
 use uuid::Uuid;
 
-use crate::ai::{AiSecret, AiSettings, DEFAULT_THRESHOLD};
+use crate::ai::{AiSecret, AiSettings, DEFAULT_THRESHOLD, LEGACY_LMR_ID};
 use crate::crypto::{self, DataKey};
 use crate::error::Error;
 use crate::providers::{AccountSet, ConnectionSecrets, NormalizedTxn};
 
 const LEDGER_FILE: &str = "ledger.enc";
+/// Copy of `ledger.enc` from before a passphrase change. Removed on the next successful unlock.
+pub const LEDGER_BACKUP: &str = "ledger.enc.backup";
+const LEDGER_BACKUP_TMP: &str = ".ledger.enc.backup.tmp";
 
 /// Seconds a status toast stays up unless the user changes it in Setup → Log.
 pub const DEFAULT_STATUS_TIMEOUT_SECS: u64 = 5;
 pub const MIN_STATUS_TIMEOUT_SECS: u64 = 1;
 pub const MAX_STATUS_TIMEOUT_SECS: u64 = 120;
+
+/// Saved look. Unknown or empty ids fall back to Ledger.
+pub const DEFAULT_THEME: &str = "ledger";
+
+/// `(id, label)` in the order Setup lists them.
+pub const THEMES: &[(&str, &str)] = &[
+    ("ledger", "Ledger"),
+    ("ink", "Ink"),
+    ("paper", "Paper"),
+    ("newsprint", "Newsprint"),
+];
+
+/// Screen shown when a ledger unlocks. Unknown ids fall back to Budget.
+pub const DEFAULT_OPEN_SCREEN: &str = "month";
+
+/// `(id, label)` for the opening-screen setting. `month` is the Budget tab.
+pub const OPEN_SCREENS: &[(&str, &str)] = &[
+    ("month", "Budget"),
+    ("activity", "Activity"),
+    ("categories", "Categories & Rules"),
+];
+
+/// Activity chip the list opens on. Unknown ids fall back to All.
+pub const DEFAULT_ACTIVITY_SCOPE: &str = "all";
+
+/// `(id, label)` for the Activity opening chip.
+pub const ACTIVITY_SCOPES: &[(&str, &str)] = &[
+    ("uncategorized", "Uncategorized"),
+    ("all", "All"),
+    ("ai", "AI"),
+    ("excluded", "Excluded"),
+];
 
 pub struct Store {
     conn: Connection,
@@ -67,6 +102,8 @@ impl Store {
         fs::write(&wp, &dec.plaintext)?;
         let conn = Connection::open(&wp)?;
         migrate(&conn)?;
+        // A passphrase change leaves the previous ledger on disk until this unlock works.
+        discard_passphrase_backup(dir)?;
         Ok(Self {
             conn,
             data_dir: dir.to_path_buf(),
@@ -76,6 +113,49 @@ impl Store {
     }
 
     pub fn persist(&self) -> Result<(), Error> {
+        self.write_ledger(&self.key, &self.salt)
+    }
+
+    /// Replace the passphrase and re-encrypt `ledger.enc`. `current` must be the one that
+    /// unlocked this ledger. The previous file is kept as `ledger.enc.backup` until a later
+    /// unlock succeeds. The in-memory key stays put until the new file is in place.
+    pub fn change_passphrase(&mut self, current: &str, new: &str) -> Result<(), Error> {
+        if new.is_empty() {
+            return Err(Error::user("Enter a new passphrase."));
+        }
+        let current_key = crypto::derive_key(current, &self.salt)?;
+        if !current_key.same_as(&self.key) {
+            return Err(Error::user("Current passphrase is wrong."));
+        }
+        if current == new {
+            return Err(Error::user(
+                "New passphrase is the same as the current one.",
+            ));
+        }
+        // Flush first so the backup matches this session, still under the current passphrase.
+        self.persist()?;
+        let snap = self.data_dir.join(LEDGER_BACKUP_TMP);
+        if let Err(err) = fs::copy(self.data_dir.join(LEDGER_FILE), &snap) {
+            let _ = fs::remove_file(&snap);
+            return Err(err.into());
+        }
+        let mut salt = [0u8; 16];
+        rand::thread_rng().fill_bytes(&mut salt);
+        let key = crypto::derive_key(new, &salt)?;
+        if let Err(err) = self.write_ledger(&key, &salt) {
+            let _ = fs::remove_file(&snap);
+            return Err(err);
+        }
+        self.key = key;
+        self.salt = salt;
+        // Install the backup only after the new ledger is in place, so a failed rewrite
+        // leaves any previous backup alone.
+        fs::rename(&snap, self.data_dir.join(LEDGER_BACKUP))?;
+        Ok(())
+    }
+
+    /// Encrypt the live database and atomically replace `ledger.enc`.
+    fn write_ledger(&self, key: &DataKey, salt: &[u8; 16]) -> Result<(), Error> {
         let dump = self
             .data_dir
             .join(format!(".dump-{}.sqlite", Uuid::new_v4()));
@@ -83,7 +163,7 @@ impl Store {
             .execute("VACUUM INTO ?1", params![dump.to_str().unwrap()])?;
         let plaintext = fs::read(&dump)?;
         let _ = fs::remove_file(&dump);
-        let enc = crypto::encrypt_existing(&self.key, &self.salt, &plaintext)?;
+        let enc = crypto::encrypt_existing(key, salt, &plaintext)?;
         let tmp_enc = self.data_dir.join(format!(".enc-{}.tmp", Uuid::new_v4()));
         fs::write(&tmp_enc, &enc)?;
         fs::rename(&tmp_enc, self.data_dir.join(LEDGER_FILE))?;
@@ -129,16 +209,26 @@ impl Store {
                 })
                 .optional()?)
         };
-        let provider = get("ai_provider")?.filter(|p| !p.is_empty());
+        let provider = get("ai_provider")?.filter(|p| !p.is_empty()).map(|p| {
+            if p == LEGACY_LMR_ID {
+                "lmr".to_string()
+            } else {
+                p
+            }
+        });
         let api_key = AiSecret(get("ai_api_key")?.unwrap_or_default());
         let threshold = get("ai_threshold")?
             .and_then(|v| v.parse::<f64>().ok())
             .map(|t| t.clamp(0.0, 1.0))
             .unwrap_or(DEFAULT_THRESHOLD);
         let after_sync = get("ai_after_sync")?.as_deref() == Some("1");
+        let endpoint = get("ai_endpoint")?.filter(|e| !e.trim().is_empty());
+        let ca_cert = get("ai_ca_cert")?.filter(|c| !c.trim().is_empty());
         Ok(AiSettings {
             provider,
             api_key,
+            endpoint,
+            ca_cert,
             threshold,
             after_sync,
         })
@@ -155,6 +245,19 @@ impl Store {
             (
                 "ai_after_sync",
                 if settings.after_sync { "1" } else { "0" }.to_string(),
+            ),
+            (
+                "ai_endpoint",
+                settings
+                    .endpoint
+                    .as_deref()
+                    .unwrap_or("")
+                    .trim()
+                    .to_string(),
+            ),
+            (
+                "ai_ca_cert",
+                settings.ca_cert.as_deref().unwrap_or("").trim().to_string(),
             ),
         ];
         for (k, v) in pairs {
@@ -213,6 +316,94 @@ impl Store {
             "INSERT INTO meta (key, value) VALUES ('status_timeout_secs', ?1)
              ON CONFLICT(key) DO UPDATE SET value=excluded.value",
             params![secs.to_string()],
+        )?;
+        self.persist()
+    }
+
+    /// The saved theme id. Falls back to Ledger when nothing is saved or the value is unknown.
+    pub fn theme(&self) -> Result<String, Error> {
+        let v: Option<String> = self
+            .conn
+            .query_row("SELECT value FROM meta WHERE key='theme'", [], |r| r.get(0))
+            .optional()?;
+        Ok(match v.as_deref() {
+            Some(id) if THEMES.iter().any(|(k, _)| *k == id) => id.to_string(),
+            _ => DEFAULT_THEME.to_string(),
+        })
+    }
+
+    /// Save the theme. Rejects an id that is not one of [`THEMES`].
+    pub fn set_theme(&self, id: &str) -> Result<(), Error> {
+        if !THEMES.iter().any(|(k, _)| *k == id) {
+            return Err(Error::user("Unknown theme."));
+        }
+        self.conn.execute(
+            "INSERT INTO meta (key, value) VALUES ('theme', ?1)
+             ON CONFLICT(key) DO UPDATE SET value=excluded.value",
+            params![id],
+        )?;
+        self.persist()
+    }
+
+    /// Which screen opens when this ledger unlocks. Unknown or empty values fall back to Budget.
+    pub fn open_screen(&self) -> Result<String, Error> {
+        self.meta_choice("open_screen", OPEN_SCREENS, DEFAULT_OPEN_SCREEN)
+    }
+
+    /// Save the opening screen. Rejects an id that is not one of [`OPEN_SCREENS`].
+    pub fn set_open_screen(&self, id: &str) -> Result<(), Error> {
+        self.set_meta_choice("open_screen", id, OPEN_SCREENS, "Unknown opening screen.")
+    }
+
+    /// Which Activity chip the list opens on. Unknown or empty values fall back to All.
+    pub fn activity_scope(&self) -> Result<String, Error> {
+        self.meta_choice("activity_scope", ACTIVITY_SCOPES, DEFAULT_ACTIVITY_SCOPE)
+    }
+
+    /// Save the Activity opening chip. Rejects an id that is not one of [`ACTIVITY_SCOPES`].
+    pub fn set_activity_scope(&self, id: &str) -> Result<(), Error> {
+        self.set_meta_choice(
+            "activity_scope",
+            id,
+            ACTIVITY_SCOPES,
+            "Unknown activity filter.",
+        )
+    }
+
+    /// A saved id from `choices`, or `default` when the row is missing or not in the list.
+    fn meta_choice(
+        &self,
+        key: &str,
+        choices: &[(&str, &str)],
+        default: &str,
+    ) -> Result<String, Error> {
+        let v: Option<String> = self
+            .conn
+            .query_row("SELECT value FROM meta WHERE key=?1", params![key], |r| {
+                r.get(0)
+            })
+            .optional()?;
+        Ok(match v.as_deref() {
+            Some(id) if choices.iter().any(|(k, _)| *k == id) => id.to_string(),
+            _ => default.to_string(),
+        })
+    }
+
+    /// Write `id` under `key` when it is one of `choices`.
+    fn set_meta_choice(
+        &self,
+        key: &str,
+        id: &str,
+        choices: &[(&str, &str)],
+        unknown: &str,
+    ) -> Result<(), Error> {
+        if !choices.iter().any(|(k, _)| *k == id) {
+            return Err(Error::user(unknown));
+        }
+        self.conn.execute(
+            "INSERT INTO meta (key, value) VALUES (?1, ?2)
+             ON CONFLICT(key) DO UPDATE SET value=excluded.value",
+            params![key, id],
         )?;
         self.persist()
     }
@@ -500,6 +691,19 @@ impl Drop for Store {
     }
 }
 
+/// Remove the pre-change ledger. A missing file is fine. A failed delete is not: the old
+/// passphrase would keep working on a leftover copy.
+fn discard_passphrase_backup(dir: &Path) -> Result<(), Error> {
+    for name in [LEDGER_BACKUP, LEDGER_BACKUP_TMP] {
+        match fs::remove_file(dir.join(name)) {
+            Ok(()) => {}
+            Err(err) if err.kind() == std::io::ErrorKind::NotFound => {}
+            Err(err) => return Err(err.into()),
+        }
+    }
+    Ok(())
+}
+
 fn migrate(conn: &Connection) -> Result<(), Error> {
     conn.execute_batch(
         r#"
@@ -594,6 +798,7 @@ fn migrate(conn: &Connection) -> Result<(), Error> {
     migrate_v7(conn)?;
     migrate_v8(conn)?;
     migrate_v9(conn)?;
+    migrate_v10(conn)?;
     Ok(())
 }
 
@@ -754,6 +959,18 @@ fn migrate_v9(conn: &Connection) -> Result<(), Error> {
     Ok(())
 }
 
+/// Schema 9 → 10: a category can be kept out of the AI option list (`send_to_ai = 0`).
+/// Existing rows stay sent. Idempotent.
+fn migrate_v10(conn: &Connection) -> Result<(), Error> {
+    if !has_column(conn, "categories", "send_to_ai")? {
+        conn.execute_batch(
+            "ALTER TABLE categories ADD COLUMN send_to_ai INTEGER NOT NULL DEFAULT 1;",
+        )?;
+    }
+    conn.execute("UPDATE meta SET value='10' WHERE key='schema'", [])?;
+    Ok(())
+}
+
 /// Pretty-print stored JSON; anything that is not JSON comes back as it was.
 fn pretty_json(s: &str) -> String {
     match serde_json::from_str::<serde_json::Value>(s) {
@@ -881,7 +1098,14 @@ mod tests {
         )
         .unwrap();
         assert!(has_column(&conn, "accounts", "institution").unwrap());
-        assert_eq!(schema, "9");
+        assert!(has_column(&conn, "categories", "send_to_ai").unwrap());
+        let send_to_ai: i64 = conn
+            .query_row("SELECT send_to_ai FROM categories WHERE id='c1'", [], |r| {
+                r.get(0)
+            })
+            .unwrap();
+        assert_eq!(send_to_ai, 1);
+        assert_eq!(schema, "10");
     }
 
     fn one_txn_set(remote_id: &str, raw: Option<&str>, acc_raw: Option<&str>) -> AccountSet {
@@ -974,6 +1198,59 @@ mod tests {
     }
 
     #[test]
+    fn change_passphrase_reencrypts_and_rejects_the_old_one() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().to_path_buf();
+        let salt_of = |blob: &[u8]| {
+            let mut salt = [0u8; 16];
+            salt.copy_from_slice(&blob[5..21]);
+            salt
+        };
+        {
+            let mut store = Store::open(&path, "old-pass").unwrap();
+            store.add_category("Food").unwrap();
+            let before = fs::read(path.join(LEDGER_FILE)).unwrap();
+
+            let err = store.change_passphrase("nope", "new-pass").unwrap_err();
+            assert_eq!(err.as_user_message(), "Current passphrase is wrong.");
+            let err = store.change_passphrase("old-pass", "").unwrap_err();
+            assert_eq!(err.as_user_message(), "Enter a new passphrase.");
+            let err = store.change_passphrase("old-pass", "old-pass").unwrap_err();
+            assert_eq!(
+                err.as_user_message(),
+                "New passphrase is the same as the current one."
+            );
+            // A rejected change must not rewrite the file.
+            assert_eq!(fs::read(path.join(LEDGER_FILE)).unwrap(), before);
+
+            assert!(!path.join(LEDGER_BACKUP).exists());
+
+            store.change_passphrase("old-pass", "new-pass").unwrap();
+            let after = fs::read(path.join(LEDGER_FILE)).unwrap();
+            assert_ne!(salt_of(&before), salt_of(&after));
+            let backup = fs::read(path.join(LEDGER_BACKUP)).unwrap();
+            let old = crypto::decrypt("old-pass", &backup).unwrap();
+            assert!(old.plaintext.windows(4).any(|w| w == b"Food"));
+            assert!(crypto::decrypt("old-pass", &after).is_err());
+            assert!(crypto::decrypt("new-pass", &backup).is_err());
+        }
+        // Locking rewrites ledger.enc with the new passphrase and must leave the backup.
+        let backup_after_close = fs::read(path.join(LEDGER_BACKUP)).unwrap();
+        assert!(crypto::decrypt("old-pass", &backup_after_close).is_ok());
+        assert!(Store::open(&path, "old-pass").is_err());
+        assert!(path.join(LEDGER_BACKUP).exists());
+        let store = Store::open(&path, "new-pass").unwrap();
+        assert!(!path.join(LEDGER_BACKUP).exists());
+        let names: Vec<_> = store
+            .list_categories()
+            .unwrap()
+            .into_iter()
+            .map(|c| c.name)
+            .collect();
+        assert_eq!(names, vec!["Food".to_string()]);
+    }
+
+    #[test]
     fn debug_flag_defaults_off_and_round_trips() {
         let dir = tempfile::tempdir().unwrap();
         let store = Store::open(dir.path(), "pass").unwrap();
@@ -1012,6 +1289,64 @@ mod tests {
     }
 
     #[test]
+    fn theme_defaults_and_round_trips() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = Store::open(dir.path(), "pass").unwrap();
+        assert_eq!(store.theme().unwrap(), DEFAULT_THEME);
+        for id in ["ink", "paper", "newsprint", "ledger"] {
+            store.set_theme(id).unwrap();
+            assert_eq!(store.theme().unwrap(), id);
+        }
+        assert!(store.set_theme("nope").is_err());
+        assert_eq!(store.theme().unwrap(), "ledger");
+        // Garbage or a blank value falls back to Ledger instead of failing.
+        store
+            .conn
+            .execute("UPDATE meta SET value='abc' WHERE key='theme'", [])
+            .unwrap();
+        assert_eq!(store.theme().unwrap(), DEFAULT_THEME);
+        store
+            .conn
+            .execute("UPDATE meta SET value='' WHERE key='theme'", [])
+            .unwrap();
+        assert_eq!(store.theme().unwrap(), DEFAULT_THEME);
+    }
+
+    #[test]
+    fn open_screen_and_activity_scope_default_and_round_trip() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = Store::open(dir.path(), "pass").unwrap();
+        assert_eq!(store.open_screen().unwrap(), DEFAULT_OPEN_SCREEN);
+        assert_eq!(store.activity_scope().unwrap(), DEFAULT_ACTIVITY_SCOPE);
+        store.set_open_screen("activity").unwrap();
+        store.set_activity_scope("uncategorized").unwrap();
+        assert_eq!(store.open_screen().unwrap(), "activity");
+        assert_eq!(store.activity_scope().unwrap(), "uncategorized");
+        store.set_open_screen("categories").unwrap();
+        store.set_activity_scope("ai").unwrap();
+        assert_eq!(store.open_screen().unwrap(), "categories");
+        assert_eq!(store.activity_scope().unwrap(), "ai");
+        store.set_activity_scope("excluded").unwrap();
+        assert_eq!(store.activity_scope().unwrap(), "excluded");
+        store.set_open_screen("month").unwrap();
+        store.set_activity_scope("all").unwrap();
+        assert!(store.set_open_screen("setup").is_err());
+        assert!(store.set_activity_scope("pending").is_err());
+        assert_eq!(store.open_screen().unwrap(), "month");
+        assert_eq!(store.activity_scope().unwrap(), "all");
+        store
+            .conn
+            .execute("UPDATE meta SET value='nope' WHERE key='open_screen'", [])
+            .unwrap();
+        store
+            .conn
+            .execute("UPDATE meta SET value='' WHERE key='activity_scope'", [])
+            .unwrap();
+        assert_eq!(store.open_screen().unwrap(), DEFAULT_OPEN_SCREEN);
+        assert_eq!(store.activity_scope().unwrap(), DEFAULT_ACTIVITY_SCOPE);
+    }
+
+    #[test]
     fn ai_settings_roundtrip_with_defaults() {
         let dir = tempfile::tempdir().unwrap();
         let store = Store::open(dir.path(), "pass").unwrap();
@@ -1020,12 +1355,16 @@ mod tests {
         assert!(s.api_key.is_empty());
         assert!((s.threshold - 0.70).abs() < 1e-9);
         assert!(!s.after_sync);
+        assert!(s.endpoint.is_none());
+        assert!(s.ca_cert.is_none());
         assert!(!s.is_configured());
 
         store
             .set_ai_settings(&AiSettings {
                 provider: Some("typesafe".into()),
                 api_key: AiSecret(" sk-1 ".into()),
+                endpoint: Some(" https://laya.home:8321 ".into()),
+                ca_cert: Some("-----BEGIN CERTIFICATE-----\nabc\n-----END CERTIFICATE-----".into()),
                 threshold: 1.5,
                 after_sync: true,
             })
@@ -1033,9 +1372,23 @@ mod tests {
         let s = store.ai_settings().unwrap();
         assert_eq!(s.provider.as_deref(), Some("typesafe"));
         assert_eq!(s.api_key.0, "sk-1");
+        assert_eq!(s.endpoint.as_deref(), Some("https://laya.home:8321"));
+        assert!(s.ca_cert.as_deref().unwrap().starts_with("-----BEGIN"));
         assert!((s.threshold - 1.0).abs() < 1e-9);
         assert!(s.after_sync);
         assert!(s.is_configured());
+
+        // Blank endpoint and certificate read back as None.
+        store
+            .set_ai_settings(&AiSettings {
+                endpoint: Some("  ".into()),
+                ca_cert: None,
+                ..s.clone()
+            })
+            .unwrap();
+        let s = store.ai_settings().unwrap();
+        assert!(s.endpoint.is_none());
+        assert!(s.ca_cert.is_none());
 
         // Clearing the provider turns the feature off again.
         store
@@ -1045,5 +1398,20 @@ mod tests {
             })
             .unwrap();
         assert!(!store.ai_settings().unwrap().is_configured());
+    }
+
+    #[test]
+    fn ai_settings_reads_legacy_laya_id_as_lmr() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = Store::open(dir.path(), "pass").unwrap();
+        store
+            .set_ai_settings(&AiSettings {
+                provider: Some(LEGACY_LMR_ID.into()),
+                ..Default::default()
+            })
+            .unwrap();
+        let s = store.ai_settings().unwrap();
+        assert_eq!(s.provider.as_deref(), Some("lmr"));
+        assert!(s.is_configured());
     }
 }

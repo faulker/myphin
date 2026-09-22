@@ -9,6 +9,7 @@ mod unlock;
 use dioxus::prelude::*;
 
 use crate::SharedStore;
+use myphin::ai::AiExchange;
 use myphin::TxnQuery;
 use status::StatusState;
 
@@ -16,7 +17,7 @@ use status::StatusState;
 /// bar shows an indicator whenever this is set.
 pub const AI_BUSY: &str = "ai";
 
-#[derive(Clone, Copy, PartialEq)]
+#[derive(Clone, Copy, Debug, PartialEq)]
 pub enum Screen {
     Month,
     Activity,
@@ -30,19 +31,57 @@ pub fn bump(mut nonce: Signal<u64>) {
     nonce.set(v + 1);
 }
 
-/// The Activity list as it opens from the nav: rows that still need a category.
-pub fn default_filter() -> TxnQuery {
-    TxnQuery {
-        uncategorized_only: true,
-        ..Default::default()
+/// Screen shown when a ledger unlocks, from a saved id. Unknown ids open Budget.
+pub fn screen_for(id: &str) -> Screen {
+    match id {
+        "activity" => Screen::Activity,
+        "categories" => Screen::Categories,
+        _ => Screen::Month,
+    }
+}
+
+/// Activity query for a saved chip id. Unknown ids list everything.
+pub fn activity_scope_query(scope: &str) -> TxnQuery {
+    match scope {
+        "uncategorized" => TxnQuery {
+            uncategorized_only: true,
+            ..Default::default()
+        },
+        "ai" => TxnQuery {
+            ai_only: true,
+            ..Default::default()
+        },
+        "excluded" => TxnQuery {
+            excluded_only: true,
+            ..Default::default()
+        },
+        _ => TxnQuery::default(),
     }
 }
 
 #[component]
 pub fn App() -> Element {
     let mut store = use_signal(|| None::<SharedStore>);
-    let mut screen = use_signal(|| Screen::Activity);
-    let mut filter = use_signal(default_filter);
+    let mut theme = use_signal(|| myphin::store::DEFAULT_THEME.to_string());
+    // A newly opened ledger replaces the painted theme. Locking leaves the signal alone,
+    // so Unlock keeps the last choice for the rest of the session.
+    let store_for_theme = store;
+    use_effect(move || {
+        let Some(shared) = store_for_theme() else {
+            return;
+        };
+        let Ok(guard) = shared.lock() else {
+            return;
+        };
+        let Ok(id) = guard.theme() else {
+            return;
+        };
+        if theme.peek().as_str() != id {
+            theme.set(id);
+        }
+    });
+    let mut screen = use_signal(|| Screen::Month);
+    let mut filter = use_signal(|| activity_scope_query(myphin::store::DEFAULT_ACTIVITY_SCOPE));
     let status = use_signal(StatusState::default);
     let nonce = use_signal(|| 0u64);
     // The connection id being synced right now, if any. Shared so the top bar and Setup agree.
@@ -75,12 +114,14 @@ pub fn App() -> Element {
     let conns = store()
         .and_then(|s| s.lock().ok().and_then(|g| g.list_connections().ok()))
         .unwrap_or_default();
+    let theme_id = theme();
 
     rsx! {
         document::Link { rel: "stylesheet", href: asset!("/assets/main.css") }
         document::Link { rel: "icon", href: asset!("/assets/icon.svg") }
+        div { class: "app", "data-theme": "{theme_id}",
         if store.read().is_none() {
-            unlock::Unlock { store }
+            unlock::Unlock { store, screen, filter }
         } else {
             div { class: "shell",
                 header { class: "top",
@@ -93,16 +134,17 @@ pub fn App() -> Element {
                         button {
                             class: if *screen.read() == Screen::Month { "nav on" } else { "nav" },
                             onclick: move |_| leave_activity(Screen::Month),
-                            "Month"
+                            "Budget"
                         }
                         button {
                             class: if *screen.read() == Screen::Activity { "nav on" } else { "nav" },
                             onclick: move |_| {
+                                let home = activity_home(store);
                                 // A different filter means a different list, so start that one from the top.
-                                if *filter.peek() != default_filter() {
+                                if *filter.peek() != home {
                                     activity_scroll.set(0.0);
                                 }
-                                filter.set(default_filter());
+                                filter.set(home);
                                 screen.set(Screen::Activity);
                             },
                             "Activity"
@@ -180,11 +222,12 @@ pub fn App() -> Element {
                         Screen::Month => rsx! { month::MonthView { store, screen, filter, nonce, status, activity_scroll } },
                         Screen::Activity => rsx! { activity::ActivityView { store, filter, nonce, status, syncing, scroll: activity_scroll } },
                         Screen::Categories => rsx! { categories::CategoriesView { store, nonce, status } },
-                        Screen::Setup => rsx! { setup::SetupView { store, nonce, status, syncing } },
+                        Screen::Setup => rsx! { setup::SetupView { store, nonce, status, syncing, theme } },
                     }
                 }
                 Toast { store, status, nonce }
             }
+        }
         }
     }
 }
@@ -238,6 +281,14 @@ fn Toast(
     }
 }
 
+/// The Activity chip this ledger opens on, or All when the ledger is locked or the value is bad.
+fn activity_home(store: Signal<Option<SharedStore>>) -> TxnQuery {
+    let scope = store()
+        .and_then(|s| s.lock().ok().and_then(|g| g.activity_scope().ok()))
+        .unwrap_or_else(|| myphin::store::DEFAULT_ACTIVITY_SCOPE.to_string());
+    activity_scope_query(&scope)
+}
+
 /// "September 2026" for a (year, month) pair.
 pub fn month_label(year: i32, month: u32) -> String {
     format!("{} {year}", month_name(month))
@@ -268,6 +319,99 @@ pub fn step_month(year: i32, month: u32, forward: bool) -> (i32, u32) {
         (m, true) => (year, m + 1),
         (m, false) => (year, m - 1),
     }
+}
+
+/// One recorded HTTP round trip: Request and Response bodies, each with a Copy button.
+#[component]
+pub(crate) fn TraceExchange(exchange: AiExchange, attempt: Option<usize>) -> Element {
+    let status_hint = match exchange.status {
+        Some(code) => format!(" HTTP {code}"),
+        None => " no response (network error)".to_string(),
+    };
+    rsx! {
+        if let Some(n) = attempt {
+            p { class: "hint", "Attempt {n}" }
+        }
+        h3 {
+            "Request"
+            span { class: "hint-inline", " {exchange.method} {exchange.url}" }
+        }
+        TraceField {
+            kind: "request",
+            text: exchange.request.clone(),
+            placeholder_when_empty: false,
+        }
+        h3 {
+            "Response"
+            span { class: "hint-inline", "{status_hint}" }
+        }
+        TraceField {
+            kind: "response",
+            text: exchange.response.clone(),
+            placeholder_when_empty: true,
+        }
+    }
+}
+
+/// Request or response body with a Copy button in the top-right corner of the field.
+#[component]
+fn TraceField(kind: &'static str, text: String, placeholder_when_empty: bool) -> Element {
+    let mut copied = use_signal(|| false);
+    let display = trace_field_display(&text, placeholder_when_empty).to_string();
+    let payload = text.clone();
+    rsx! {
+        div { class: "trace-field",
+            button {
+                class: "ghost small trace-copy",
+                aria_label: "Copy {kind}",
+                onclick: move |_| {
+                    copy_to_clipboard(&payload);
+                    copied.set(true);
+                },
+                if copied() { "Copied" } else { "Copy" }
+            }
+            pre { "{display}" }
+        }
+    }
+}
+
+/// Body shown in a trace field. Empty responses read as "(empty)"; Copy still gets the raw body.
+fn trace_field_display(text: &str, placeholder_when_empty: bool) -> &str {
+    if placeholder_when_empty && text.is_empty() {
+        "(empty)"
+    } else {
+        text
+    }
+}
+
+/// JSON-encode `text` as a JavaScript string literal.
+fn js_string_literal(text: &str) -> String {
+    serde_json::to_string(text).unwrap_or_else(|_| "\"\"".into())
+}
+
+/// Put `text` on the system clipboard from the webview.
+/// The payload is JSON-encoded into a string literal so it cannot break out of the script;
+/// `document::eval` here runs only this fixed clipboard helper, the same way scroll uses eval.
+fn copy_to_clipboard(text: &str) {
+    let json = js_string_literal(text);
+    document::eval(&format!(
+        r#"(async () => {{
+            const t = {json};
+            try {{
+                await navigator.clipboard.writeText(t);
+            }} catch (e) {{
+                const ta = document.createElement('textarea');
+                ta.value = t;
+                ta.setAttribute('readonly', '');
+                ta.style.position = 'fixed';
+                ta.style.left = '-9999px';
+                document.body.appendChild(ta);
+                ta.select();
+                document.execCommand('copy');
+                document.body.removeChild(ta);
+            }}
+        }})()"#
+    ));
 }
 
 /// "Just now", "12 min ago", "3 h ago", or a date, for last-sync stamps.
@@ -308,5 +452,38 @@ mod tests {
         assert_eq!(relative_time(now - 7200, now), "2 h ago");
         assert_eq!(relative_time(now - 3 * 86_400, now), "3 d ago");
         assert!(relative_time(now - 30 * 86_400, now).contains(", 20"));
+    }
+
+    #[test]
+    fn trace_field_display_placeholder_only_when_empty() {
+        assert_eq!(trace_field_display("", true), "(empty)");
+        assert_eq!(trace_field_display("", false), "");
+        assert_eq!(trace_field_display("{}", true), "{}");
+    }
+
+    #[test]
+    fn screen_for_maps_saved_ids_and_falls_back_to_budget() {
+        assert_eq!(screen_for("month"), Screen::Month);
+        assert_eq!(screen_for("activity"), Screen::Activity);
+        assert_eq!(screen_for("categories"), Screen::Categories);
+        assert_eq!(screen_for("nope"), Screen::Month);
+        assert_eq!(screen_for(""), Screen::Month);
+    }
+
+    #[test]
+    fn activity_scope_query_maps_chips_and_falls_back_to_all() {
+        assert!(activity_scope_query("uncategorized").uncategorized_only);
+        assert!(activity_scope_query("ai").ai_only);
+        assert!(activity_scope_query("excluded").excluded_only);
+        assert_eq!(activity_scope_query("all"), TxnQuery::default());
+        assert_eq!(activity_scope_query("nope"), TxnQuery::default());
+    }
+
+    #[test]
+    fn js_string_literal_escapes_quotes_and_newlines() {
+        assert_eq!(js_string_literal(r#"{"a":"b"}"#), r#""{\"a\":\"b\"}""#);
+        assert_eq!(js_string_literal("line1\nline2"), r#""line1\nline2""#);
+        assert_eq!(js_string_literal("say \"hi\""), r#""say \"hi\"""#);
+        assert_eq!(js_string_literal(""), r#""""#);
     }
 }

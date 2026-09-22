@@ -144,10 +144,11 @@ pub fn MonthView(
                 for row in rows {
                     {
                         let has_cap = row.cap_cents > 0;
-                        let over = has_cap && row.spent_cents > row.cap_cents;
+                        let band = pace(row.spent_cents, row.cap_cents);
+                        let over = band == "over";
                         let left = row.cap_cents - row.spent_cents;
                         let cid = row.category_id.clone();
-                        let mut class = String::from(if over { "over" } else if !has_cap { "uncapped" } else { "" });
+                        let mut class = String::from(if has_cap { band } else { "uncapped" });
                         if row.parent_id.is_some() {
                             class.push_str(" child");
                         }
@@ -173,8 +174,8 @@ pub fn MonthView(
                                             "${format_cents(left)} left"
                                         }
                                     }
-                                    span { class: "bar", role: "presentation",
-                                        span { class: "fill", style: "width: {pct(row.spent_cents, row.cap_cents)}%" }
+                                    span { class: "bar", role: "presentation", title: "{pace_label(band)}",
+                                        span { class: "fill {band}", style: "width: {pct(row.spent_cents, row.cap_cents)}%" }
                                     }
                                 }
                             }
@@ -201,6 +202,34 @@ fn pct(spent: i64, cap: i64) -> i64 {
     ((spent * 100) / cap).clamp(0, 100)
 }
 
+/// Where spending sits against the cap: under half, from half up to 80%, from 80% through
+/// the cap, or past it. A missing cap is treated as under so the hidden bar has a class.
+fn pace(spent: i64, cap: i64) -> &'static str {
+    if cap <= 0 {
+        return "under";
+    }
+    let ratio = (spent as i128).saturating_mul(1000) / cap as i128;
+    if ratio < 500 {
+        "under"
+    } else if ratio < 800 {
+        "mid"
+    } else if spent <= cap {
+        "near"
+    } else {
+        "over"
+    }
+}
+
+/// Short name for the bar's tooltip.
+fn pace_label(band: &str) -> &'static str {
+    match band {
+        "mid" => "Mid budget",
+        "near" => "Near budget",
+        "over" => "Over budget",
+        _ => "Well under budget",
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -211,5 +240,22 @@ mod tests {
         assert_eq!(pct(500, 100), 100);
         assert_eq!(pct(-5, 100), 0);
         assert_eq!(pct(10, 0), 0);
+    }
+
+    #[test]
+    fn pace_bands() {
+        assert_eq!(pace(0, 100), "under");
+        assert_eq!(pace(49, 100), "under");
+        assert_eq!(pace(50, 100), "mid");
+        assert_eq!(pace(79, 100), "mid");
+        assert_eq!(pace(80, 100), "near");
+        assert_eq!(pace(100, 100), "near");
+        assert_eq!(pace(101, 100), "over");
+        assert_eq!(pace(-10, 100), "under");
+        assert_eq!(pace(10, 0), "under");
+        assert_eq!(pace_label("under"), "Well under budget");
+        assert_eq!(pace_label("mid"), "Mid budget");
+        assert_eq!(pace_label("near"), "Near budget");
+        assert_eq!(pace_label("over"), "Over budget");
     }
 }

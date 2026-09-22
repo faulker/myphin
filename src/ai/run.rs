@@ -89,9 +89,13 @@ pub(super) fn ai_context(
     let provider_id = settings.provider.as_deref().unwrap_or_default();
     let categorizer = categorizer_for(provider_id)
         .ok_or_else(|| Error::user("That AI provider is not available in this build."))?;
-    let options: Vec<CategoryOption> = store
-        .list_categories()?
+    let cats = store.list_categories()?;
+    if cats.is_empty() {
+        return Err(Error::user("Add at least one category before using AI."));
+    }
+    let options: Vec<CategoryOption> = cats
         .into_iter()
+        .filter(|c| c.is_sent_to_ai())
         .map(|c| CategoryOption {
             id: c.id.clone(),
             // A sub-category goes as "Parent › Child" so the model sees where it sits.
@@ -100,7 +104,9 @@ pub(super) fn ai_context(
         })
         .collect();
     if options.is_empty() {
-        return Err(Error::user("Add at least one category before using AI."));
+        return Err(Error::user(
+            "Turn on Send to AI for at least one category first.",
+        ));
     }
     Ok((settings, categorizer, options))
 }
@@ -142,8 +148,7 @@ fn categorize_rows(
                 // Record the round trip so Activity's debug view can show exactly what was
                 // sent and answered for this payee. Headers (the key) are never kept.
                 let recorder = RecordingTransport::new(transport);
-                let outcome =
-                    categorizer.categorize(&settings.api_key, &input, &options, &recorder);
+                let outcome = categorizer.categorize(&settings, &input, &options, &recorder);
                 let exchanges = recorder.into_exchanges();
                 match outcome {
                     Ok(guess) => {
@@ -264,6 +269,7 @@ mod tests {
             api_key: AiSecret("k".into()),
             threshold,
             after_sync,
+            ..Default::default()
         })
         .unwrap();
     }
@@ -642,6 +648,59 @@ mod tests {
         assert_eq!(r.categorized, 1);
         s.rename_category(&food, "Eats").unwrap();
         assert!(s.ai_answer("aaa market").unwrap().is_none());
+        // Send-to-AI also changes the option list, so it clears the cache too.
+        seed(&s, &[("BBB DINER", -100)]);
+        let t3 = ScriptedTransport::new(vec![ok("Eats", 0.95)]);
+        categorize_uncategorized(&s, &t3).unwrap();
+        assert!(s.ai_answer("bbb diner").unwrap().is_some());
+        s.set_category_send_to_ai(&food, false).unwrap();
+        assert!(s.ai_answer("bbb diner").unwrap().is_none());
+    }
+
+    #[test]
+    fn hidden_categories_are_not_sent_and_all_hidden_is_an_error() {
+        let (_d, s) = store();
+        let food = s.add_category("Food").unwrap();
+        s.set_category_description(&food, "Groceries and restaurants")
+            .unwrap();
+        let other = s.add_category("Other").unwrap();
+        s.set_category_send_to_ai(&other, false).unwrap();
+        configure(&s, 0.70, false);
+        seed(&s, &[("COSTCO WHSE", -5000)]);
+
+        let t = ScriptedTransport::new(vec![ok("Food", 0.91)]);
+        categorize_uncategorized(&s, &t).unwrap();
+        let body: serde_json::Value =
+            serde_json::from_slice(&t.requests.lock().unwrap()[0].2).unwrap();
+        let criteria = &body["questions"]["category"]["criteria"];
+        assert_eq!(criteria["Food"], "Groceries and restaurants");
+        assert!(criteria.get("Other").is_none());
+
+        s.set_category_send_to_ai(&food, false).unwrap();
+        let t2 = ScriptedTransport::new(vec![]);
+        let e = categorize_uncategorized(&s, &t2).unwrap_err();
+        assert!(e.as_user_message().contains("Send to AI"));
+        assert_eq!(t2.calls(), 0);
+    }
+
+    #[test]
+    fn parent_off_omits_its_children_from_the_option_list() {
+        let (_d, s) = store();
+        let food = s.add_category("Food").unwrap();
+        s.add_subcategory(&food, "Dining").unwrap();
+        s.add_category("Gas").unwrap();
+        configure(&s, 0.70, false);
+        seed(&s, &[("CAFE", -500)]);
+        s.set_category_send_to_ai(&food, false).unwrap();
+
+        let t = ScriptedTransport::new(vec![ok("Gas", 0.91)]);
+        categorize_uncategorized(&s, &t).unwrap();
+        let body: serde_json::Value =
+            serde_json::from_slice(&t.requests.lock().unwrap()[0].2).unwrap();
+        let criteria = &body["questions"]["category"]["criteria"];
+        assert!(criteria.get("Food").is_none());
+        assert!(criteria.get("Food › Dining").is_none());
+        assert!(criteria.get("Gas").is_some());
     }
 
     #[test]

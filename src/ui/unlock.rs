@@ -3,8 +3,10 @@ use std::sync::{Arc, Mutex};
 
 use dioxus::prelude::*;
 
+use super::{activity_scope_query, screen_for, Screen};
 use crate::SharedStore;
 use myphin::Store;
+use myphin::TxnQuery;
 
 fn last_dir_path() -> PathBuf {
     dirs::config_dir()
@@ -25,8 +27,14 @@ fn save_last_dir(dir: &str) {
 }
 
 #[component]
-pub fn Unlock(store: Signal<Option<SharedStore>>) -> Element {
+pub fn Unlock(
+    store: Signal<Option<SharedStore>>,
+    screen: Signal<Screen>,
+    filter: Signal<TxnQuery>,
+) -> Element {
     let mut store = store;
+    let mut screen = screen;
+    let mut filter = filter;
     let mut dir = use_signal(load_last_dir);
     let mut passphrase = use_signal(|| String::new());
     let mut error = use_signal(|| None::<String>);
@@ -43,6 +51,15 @@ pub fn Unlock(store: Signal<Option<SharedStore>>) -> Element {
             Ok(s) => {
                 save_last_dir(dir.read().trim());
                 passphrase.set(String::new());
+                // Apply before the shell paints, so the first frame is the saved screen.
+                let screen_id = s
+                    .open_screen()
+                    .unwrap_or_else(|_| myphin::store::DEFAULT_OPEN_SCREEN.to_string());
+                let scope = s
+                    .activity_scope()
+                    .unwrap_or_else(|_| myphin::store::DEFAULT_ACTIVITY_SCOPE.to_string());
+                screen.set(screen_for(&screen_id));
+                filter.set(activity_scope_query(&scope));
                 store.set(Some(Arc::new(Mutex::new(s))));
             }
             Err(e) => error.set(Some(e.as_user_message())),
