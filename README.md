@@ -1,68 +1,155 @@
 # Myphin
 
-Personal finance tracker for a folder you control. Syncs bank data through [SimpleFIN](https://www.simplefin.org/protocol.html), categorizes with keyboard-first Activity (learns payees as you go; wildcard rules like `*costco*` (Categories & Rules) override, with a live preview of what they match; one rule can hold several patterns, edited as a list where each one can be changed or removed on its own), and tracks monthly category caps. Categories can nest one level (`Investment › Fees`), a parent's spend rolling up its sub-categories', and any category can be kept out of the budget so its rows are categorized without touching caps or the month's spent. Rules can also mark matching rows as transfers, credit card payments, loan payments, income, or excluded (payments are transfers with a label, so they never count as spending; an Excluded chip in Activity lists everything excluded so it can be included again), can be created straight from a transaction in Activity (or a transaction can be added to an existing rule, with the pattern edited to add wildcards first), edited later in Categories & Rules, and apply to every matching row the moment they are added or changed. Any account can be hidden from Setup. Rows that no rule or remembered payee covers can be sent to an AI service ([typesafe.ai](https://typesafe.ai), or a model you host with [lmr-rs](https://github.com/faulker/lmr-rs) on this machine or one on your network, no API key needed (it will not match typesafe.ai; [openbmb/MiniCPM5-2B-GGUF](https://huggingface.co/openbmb/MiniCPM5-2B-GGUF) is the best local model); more behind one trait; see `docs/ai.md`), which picks a category from your category descriptions and only applies it above a confidence threshold you set (70% by default). One Rust crate, [Dioxus](https://dioxuslabs.com/) desktop UI, no npm.
+**A private, keyboard-friendly budget app that keeps your money data in a folder you own.**
 
-## Setup
+Myphin pulls in your bank transactions, helps you sort them into categories, and shows how each category is doing against a monthly cap. There's no account to sign up for and no cloud service holding your data. Everything lives in one encrypted file, in a folder you pick.
 
-- Rust 1.93+ (`rustup`)
+![Budget screen showing monthly spending by category against caps](docs/screenshots/budget.png)
+
+## Why Myphin
+
+- **Your data stays yours.** The ledger is a single encrypted file (`ledger.enc`). Put the folder in iCloud Drive, Syncthing, or wherever you already keep backups.
+- **Real bank data.** Transactions sync through [SimpleFIN Bridge](https://bridge.simplefin.org/), which connects to many banks and card issuers.
+- **Fast to categorize.** Arrow through transactions, type the first few letters of a category, press Enter. Myphin remembers payees so you rarely do it twice.
+- **Rules that do the boring part.** `*costco*` → Groceries. Rules apply instantly to past and future rows, and you see what a pattern matches before you save it.
+- **Monthly caps, not spreadsheets.** Set a cap once and it carries forward. The Budget screen shows what's left and what's over at a glance.
+- **Optional AI help.** For payees nothing else covers, Myphin can ask an AI model to suggest a category. It only sends the payee name and whether money went in or out.
+
+## A quick tour
+
+### Budget
+
+See the month at a glance: total spent, income, and every category's progress toward its cap. Categories can nest one level (like `Food › Groceries`), and a parent rolls up its children's spending. Use `←` and `→` to move between months.
+
+### Activity
+
+Every transaction in one list. Filter by account, category, or month, or search by payee, notes, or amount. Chips at the top jump to what needs attention: Uncategorized rows, rows the AI sorted for you to review, and anything you've excluded.
+
+![Activity screen listing transactions with their account and category](docs/screenshots/activity.png)
+
+### Categories and caps
+
+Add categories, nest them, and set a monthly cap on each. A short description on each category helps the AI pick the right one. You can keep a category out of the budget entirely (it still gets tracked, it just doesn't count toward caps), or keep it off the list the AI sees.
+
+![Categories & caps screen with descriptions, budget toggles, and cap amounts](docs/screenshots/categories.png)
+
+### Rules
+
+A rule matches the bank's description with simple wildcards (`*` for anything, `?` for one character). It can set a category, or mark a row as a transfer, credit card payment, loan payment, income, or excluded. Payments and transfers never count as spending. You can also create a rule straight from a transaction in Activity.
+
+![Rules screen with wildcard patterns and their actions](docs/screenshots/rules.png)
+
+### Setup
+
+Connect banks, hide accounts you don't care about, pick a theme (Ledger, Ink, Paper, or Newsprint), configure AI, and change your passphrase.
+
+![Setup screen showing a connected bank and its accounts](docs/screenshots/setup.png)
+
+## Getting started
+
+### 1. Install the tools
+
+- [Rust](https://rustup.rs/) 1.93 or newer
 - [Dioxus CLI](https://dioxuslabs.com/learn/0.7/getting_started/): `cargo install dioxus-cli`
-- macOS: no extra packages. Linux: WebKitGTK (see Dioxus desktop docs). Windows: WebView2.
+- macOS needs nothing else. Linux needs WebKitGTK (see the Dioxus desktop docs). Windows needs WebView2.
+
+### 2. Run it
 
 ```bash
 git clone <this-repo>
 cd myphin
-cargo test
 dx serve --desktop
-# or
-cargo run
 ```
 
-First launch: pick a data folder and a passphrase. An empty folder creates a new encrypted ledger (`ledger.enc`). The passphrase is never stored. Put that folder in iCloud Drive / Syncthing if you want a backup.
+### 3. Create your ledger
 
-Get a SimpleFIN setup token from [SimpleFIN Bridge](https://bridge.simplefin.org/simplefin/create) (demo tokens: [developer page](https://beta-bridge.simplefin.org/info/developers)), paste it in Setup (the cog at the top right), Connect and sync. After that, the Sync… dropdown in the top bar re-syncs any connection without leaving the current screen.
+On first launch, pick an empty folder and choose a passphrase. Myphin creates an encrypted ledger there.
 
-Optional: in Setup → AI pick a provider, paste its API key (for "LMR" the key is optional and there are Server URL and certificate fields instead; blank means an `lmr-rs` on this machine), set the confidence threshold, and choose whether it runs after every sync. Add a short description to each category in Categories & Rules (that is what the model reads). Untick Send to AI on a category to keep it off that list (unticking a parent also unticks its sub-categories); rules and hand edits can still assign it. "Categorize with AI" handles whatever is still uncategorized; in Activity, "Ask AI" in a row's editor sends just that row, and the Uncategorized list has a button for the rows on screen; the rows show an `ai` tag and the AI chip in Activity lists them for review. Only the payee and the money-in/out direction are sent. To see exactly what goes out and comes back, "Debug a transaction" in Setup → AI sends any one row and shows the request JSON, the response, the highest-rated category, and how long the call took, without changing anything. A model you host will not match typesafe.ai. For the best local results, serve [openbmb/MiniCPM5-2B-GGUF](https://huggingface.co/openbmb/MiniCPM5-2B-GGUF) (`lmr-rs models download minicpm5-2b`, then `lmr-rs serve`). A CPU build can take tens of seconds per payee; a Metal build (`--features metal`) is much faster. Hosting steps are in `docs/ai.md`.
+> **Write your passphrase down.** It's never stored anywhere, so there's no way to recover it if you forget.
 
-Setup → Debug adds two buttons to every row's editor in Activity: Raw data (the bank's own JSON for the transaction and its account, kept verbatim on every sync) and AI trace (the exact request and response recorded when the AI was asked about that payee). Both read from the ledger and send nothing.
+### 4. Connect your bank
 
-Setup → Appearance picks the look: Ledger (the default), Ink, Paper, or Newsprint. It also chooses the screen the ledger opens on (Budget by default) and the Activity chip that list starts on (All by default). Both are saved with the ledger.
+1. Get a setup token from [SimpleFIN Bridge](https://bridge.simplefin.org/simplefin/create). Want to try it first? Grab a demo token from the [developer page](https://beta-bridge.simplefin.org/info/developers).
+2. In Myphin, open Setup (the gear, top right), paste the token, and click Connect.
+3. Sync. Later you can re-sync any connection from the **Sync…** menu in the top bar.
 
-Setup → Passphrase changes the passphrase. The ledger is re-encrypted. `ledger.enc.backup` keeps a copy under the previous passphrase until the next successful unlock with the new one. If that unlock fails, quit, replace `ledger.enc` with `ledger.enc.backup`, and use the previous passphrase. There is still no recovery if you forget both.
+### 5. Start sorting
 
-## Build
+Go to Categories & Rules and add a few categories. Then head to Activity, pick the Uncategorized chip, and start typing. Add rules for anything that repeats.
+
+## AI categorization (optional)
+
+Myphin can send rows that no rule or remembered payee covers to an AI model. It picks a category using your category descriptions and only applies it when it's confident enough (70% by default, adjustable).
+
+You have two options, both set up in Setup → AI:
+
+- **[typesafe.ai](https://typesafe.ai)**, a hosted service. Paste your API key.
+- **A model you run yourself** with [lmr-rs](https://github.com/faulker/lmr-rs), on this machine or elsewhere on your network. No API key needed. [openbmb/MiniCPM5-2B-GGUF](https://huggingface.co/openbmb/MiniCPM5-2B-GGUF) gives the best local results (`lmr-rs models download minicpm5-2b`, then `lmr-rs serve`). A Metal build (`--features metal`) is much faster than CPU on a Mac.
+
+Only the payee name and whether money went in or out are ever sent. Rows the AI categorized get an `ai` tag, and the AI chip in Activity lists them so you can double-check. To see exactly what goes over the wire, use "Debug a transaction" in Setup → AI.
+
+Full details, including how to host a model and add a new provider, are in [`docs/ai.md`](docs/ai.md).
+
+## Keyboard shortcuts
+
+In Activity:
+
+| Key | What it does |
+| --- | --- |
+| `↑` / `↓` | Move between rows |
+| Type + `Enter` | Set the category (a unique prefix is enough) |
+| `Space` | Select a row |
+| `⌘E` | Exclude |
+| `⌘⌫` twice | Delete |
+| `/` | Jump to search |
+
+On the Budget screen, `←` and `→` change the month. The full list is in [`docs/ui-spec.md`](docs/ui-spec.md).
+
+## Privacy and security
+
+- The ledger is encrypted with Argon2id and XChaCha20-Poly1305. Your passphrase is never saved.
+- SimpleFIN access URLs and AI keys are stored inside the encrypted ledger and never written to logs.
+- All connections use HTTPS. The one exception is a self-hosted model on your local network, which may use plain HTTP.
+- While Myphin is open, a temporary unlocked copy (`.workspace.sqlite`) sits in the data folder. It's deleted when you quit. **Sync `ledger.enc`, not that file.**
+
+### Changing your passphrase
+
+Setup → Passphrase re-encrypts the ledger. Myphin keeps `ledger.enc.backup` under the old passphrase until you successfully unlock with the new one. If that unlock fails, quit, replace `ledger.enc` with `ledger.enc.backup`, and use the old passphrase.
+
+## For developers
+
+### Build
 
 ```bash
-dx bundle --desktop     # release bundle
+dx bundle --desktop     # release bundle (.app on macOS)
 cargo build --release
 ```
 
-## Test
+`cargo run` also works, but styles only load through `dx`, so use `dx serve --desktop` for day-to-day work.
+
+### Test
 
 ```bash
 cargo test
-cargo test -- --ignored   # live SimpleFIN demo token (network)
+cargo test -- --ignored   # live tests: SimpleFIN demo token (network), local lmr-rs
 ```
 
-## Layout
+### Debug tools
 
-- `src/providers` — `TransactionSource` trait + SimpleFIN, `Transport` HTTP abstraction
-- `src/ai` — `Categorizer` trait, the shared System One wire code, typesafe.ai and the self-hosted lmr-rs provider, the AI pass
-- `src/sync` — windowed fetch, importer, dedup
-- `src/store` — encrypted SQLite
-- `src/domain` — categories, caps, rules, splits
-- `src/ui` — Budget / Activity / Categories & Rules / Setup
-- `assets` — `main.css`, and the app icon: `icon.svg` is the source, `icon.png` is the Dock icon on `cargo run`, `icon.icns` is what `dx bundle` ships
-- `docs/simplefin.md` — protocol packet
-- `docs/ui-spec.md` — screens and keys
-- `docs/ai.md` — AI categorization, adding a provider
+Setup → Debug adds two buttons to each row's editor in Activity: **Raw data** (the bank's original JSON for that transaction) and **AI trace** (the exact request and response for that payee). Both read from the ledger and send nothing.
 
-## Security
+### Project layout
 
-- The data folder holds `ledger.enc` (Argon2id + XChaCha20-Poly1305). The passphrase is never stored. Changing it in Setup re-encrypts the file under a new salt and leaves `ledger.enc.backup` (the previous passphrase) until the next successful unlock.
-- SimpleFIN Access URLs and AI keys live in that ledger, not in logs (`ConnectionSecrets` and `AiSecret` debug-print as `***`).
-- Claim POSTs do not follow redirects. All provider URLs must be HTTPS, or plain HTTP to a local network address (loopback, private and link-local IPs, `.local`-style names) for a self-hosted model server; a pasted certificate is trusted for that server only.
-- While the app is open, `.workspace.sqlite` exists unlocked in the data folder. It is deleted on exit. Don't sync that file; sync `ledger.enc`.
+- `src/providers`: `TransactionSource` trait, SimpleFIN, and the `Transport` HTTP abstraction
+- `src/ai`: `Categorizer` trait, shared wire code, typesafe.ai and lmr-rs providers, the AI pass
+- `src/sync`: windowed fetch, importer, dedup
+- `src/store`: encrypted SQLite
+- `src/domain`: categories, caps, rules, splits
+- `src/ui`: Budget, Activity, Categories & Rules, Setup
+- `assets`: `main.css` and the app icon (`icon.svg` source, `icon.png` for `cargo run`, `icon.icns` for bundles)
+- `docs/simplefin.md`: SimpleFIN protocol notes
+- `docs/ui-spec.md`: screens and keys
+- `docs/ai.md`: AI categorization and adding a provider
+- `docs/screenshots`: images used in this README
 
-## Keys
-
-In Activity, `↑`/`↓` move, type a category name (a unique prefix is enough) and press Enter. `Space` selects, `⌘E` excludes, `⌘⌫` twice deletes, `/` jumps to search. Search matches payee, notes, or an amount; filter by account, category, and month. Full key table in `docs/ui-spec.md`.
+Built with Rust and [Dioxus](https://dioxuslabs.com/). One crate, no npm.
