@@ -6,7 +6,7 @@
 
 use std::time::Duration;
 
-use super::systemone::post_systemone;
+use super::systemone::{post_systemone, DEFAULT_MODEL};
 use super::{AiSettings, CategorizeInput, Categorizer, CategoryGuess, CategoryOption};
 use crate::error::Error;
 use crate::providers::{url_allowed, Transport};
@@ -77,6 +77,7 @@ impl Categorizer for Lmr {
         let endpoint = format!("{base}{PATH}");
         post_systemone(
             &endpoint,
+            DEFAULT_MODEL,
             &settings.api_key,
             settings.ca_cert_pem(),
             REQUEST_TIMEOUT,

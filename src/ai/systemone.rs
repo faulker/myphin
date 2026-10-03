@@ -1,7 +1,7 @@
 //! Shared System One wire protocol: the request/response shapes, the retry loop, and the error
 //! mapping used by every provider that speaks it. typesafe.ai speaks it over HTTPS; lmr-rs
-//! (`ai::Lmr`) speaks the identical protocol on loopback. The `model` field is sent for
-//! compatibility but `lmr-rs` ignores it.
+//! (`ai::Lmr`) and Ollaya (via `ai::SystemOne`) speak the identical protocol. The `model` field
+//! is chosen by the caller; `lmr-rs` ignores it, Ollaya routes on it.
 
 use std::collections::{BTreeMap, HashMap};
 use std::time::Duration;
@@ -13,7 +13,8 @@ use crate::error::{Error, InternalError};
 use crate::providers::{Transport, TransportRequest, TRANSPORT_TIMEOUT_MSG};
 use crate::sanitize::sanitize_user_text;
 
-const MODEL: &str = "jev-latest";
+/// typesafe.ai's model alias, also what the official SDK sends when none is given.
+pub const DEFAULT_MODEL: &str = "jev-latest";
 const QUESTION_ID: &str = "category";
 /// The choice key that means "nothing fits".
 const OTHER: &str = "other";
@@ -41,7 +42,7 @@ struct Question<'a> {
 #[derive(Serialize)]
 struct Request<'a> {
     state: State<'a>,
-    model: &'static str,
+    model: &'a str,
     questions: BTreeMap<&'static str, Question<'a>>,
 }
 
@@ -54,6 +55,9 @@ struct Response {
 struct Answer {
     choice: String,
     confidence: f64,
+    /// Per-choice scores. Values are kept as JSON so a stray null does not fail the parse.
+    #[serde(default)]
+    probabilities: HashMap<String, serde_json::Value>,
 }
 
 #[derive(Deserialize)]
@@ -63,8 +67,10 @@ struct ErrorBody {
 }
 
 /// Build the JSON body and the map from criteria key back to category id. Keys are the
-/// sanitized category names (the model reads them), made unique with a numeric suffix.
+/// sanitized category names (the model reads them), made unique with a numeric suffix. `model`
+/// is sent as-is in the body's `model` field.
 pub fn build_request(
+    model: &str,
     input: &CategorizeInput,
     options: &[CategoryOption],
 ) -> Result<(Vec<u8>, HashMap<String, String>), Error> {
@@ -110,7 +116,7 @@ pub fn build_request(
                 Direction::Out => "money out",
             },
         },
-        model: MODEL,
+        model,
         questions,
     };
     let body = serde_json::to_vec(&req).map_err(|_| Error::Internal(InternalError::Json))?;
@@ -131,7 +137,30 @@ pub fn parse_response(
     Ok(CategoryGuess {
         category_id: key_to_id.get(&answer.choice).cloned(),
         confidence: answer.confidence.clamp(0.0, 1.0),
+        probability: choice_probability(&answer.probabilities, &answer.choice),
     })
+}
+
+/// The picked choice's probability, clamped to 0..1. 0 when missing or not a finite number.
+fn choice_probability(probs: &HashMap<String, serde_json::Value>, choice: &str) -> f64 {
+    probs
+        .get(choice)
+        .and_then(serde_json::Value::as_f64)
+        .filter(|p| p.is_finite())
+        .map_or(0.0, |p| p.clamp(0.0, 1.0))
+}
+
+/// The picked choice's probability read from a raw (possibly pretty-printed) response body.
+/// 0 when the body is not a System One answer or has no score for the pick. Used to backfill
+/// answers cached before the probability was stored.
+pub(crate) fn pick_probability(body: &str) -> f64 {
+    let Ok(parsed) = serde_json::from_str::<Response>(body) else {
+        return 0.0;
+    };
+    parsed
+        .answers
+        .get(QUESTION_ID)
+        .map_or(0.0, |a| choice_probability(&a.probabilities, &a.choice))
 }
 
 /// Short, sanitized message from an error body, if it has one.
@@ -151,13 +180,14 @@ fn error_message(body: &[u8]) -> Option<String> {
 
 /// Send one System One request and apply the shared retry/error handling. The bearer header is
 /// added only when `key` is non-empty; a provider that requires a key checks that itself before
-/// calling in. `unreachable_msg` is shown when the transport call itself fails (e.g. nothing is
+/// calling in. `model` goes in the body's `model` field. `unreachable_msg` is shown when the transport call itself fails (e.g. nothing is
 /// listening at `endpoint`). `timeout` is the whole-request budget (local inference needs more
 /// than reqwest's 30s default). `timeout_msg` is shown when that budget runs out. 429 and 529
 /// are retried with backoff; every other failure is a user-facing error that never contains
 /// the key.
 pub fn post_systemone(
     endpoint: &str,
+    model: &str,
     key: &AiSecret,
     root_cert_pem: Option<&str>,
     timeout: Duration,
@@ -167,7 +197,7 @@ pub fn post_systemone(
     unreachable_msg: &str,
     timeout_msg: &str,
 ) -> Result<CategoryGuess, Error> {
-    let (body, key_to_id) = build_request(input, options)?;
+    let (body, key_to_id) = build_request(model, input, options)?;
     let mut headers = Vec::new();
     if !key.is_empty() {
         headers.push((
@@ -267,7 +297,7 @@ mod tests {
 
     #[test]
     fn request_matches_typesafe_shape() {
-        let (body, map) = build_request(&input(), &opts()).unwrap();
+        let (body, map) = build_request(DEFAULT_MODEL, &input(), &opts()).unwrap();
         let v: serde_json::Value = serde_json::from_slice(&body).unwrap();
         assert_eq!(v["model"], "jev-latest");
         assert_eq!(v["state"]["transactionTitle"], "AMEX EPAYMENT ACH PMT");
@@ -288,12 +318,12 @@ mod tests {
 
     #[test]
     fn request_needs_a_category() {
-        assert!(build_request(&input(), &[]).is_err());
+        assert!(build_request(DEFAULT_MODEL, &input(), &[]).is_err());
     }
 
     #[test]
     fn response_maps_choice_and_other() {
-        let (_, map) = build_request(&input(), &opts()).unwrap();
+        let (_, map) = build_request(DEFAULT_MODEL, &input(), &opts()).unwrap();
         let g = parse_response(&ok_body("Dining", 0.82), &map).unwrap();
         assert_eq!(g.category_id.as_deref(), Some("c-dining"));
         assert!((g.confidence - 0.82).abs() < 1e-9);
@@ -302,5 +332,32 @@ mod tests {
         let g = parse_response(&ok_body("Unknown", 0.9), &map).unwrap();
         assert_eq!(g.category_id, None);
         assert!(parse_response(b"not json", &map).is_err());
+    }
+
+    #[test]
+    fn response_reads_the_picks_probability() {
+        let (_, map) = build_request(DEFAULT_MODEL, &input(), &opts()).unwrap();
+        let body = br#"{"answers":{"category":{"choice":"Dining","probabilities":{"Gas":0.55,"Dining":0.35,"other":0.1},"confidence":0.4}}}"#;
+        let g = parse_response(body, &map).unwrap();
+        assert!((g.probability - 0.35).abs() < 1e-9);
+        // Empty map, missing field, and a null entry all read as 0.
+        assert_eq!(
+            parse_response(&ok_body("Dining", 0.8), &map)
+                .unwrap()
+                .probability,
+            0.0
+        );
+        let missing = br#"{"answers":{"category":{"choice":"Dining","confidence":0.8}}}"#;
+        assert_eq!(parse_response(missing, &map).unwrap().probability, 0.0);
+        let null = br#"{"answers":{"category":{"choice":"Dining","probabilities":{"Dining":null},"confidence":0.8}}}"#;
+        assert_eq!(parse_response(null, &map).unwrap().probability, 0.0);
+    }
+
+    #[test]
+    fn pick_probability_reads_raw_bodies() {
+        let pretty = "{\n  \"answers\": {\n    \"category\": {\n      \"choice\": \"Gas\",\n      \"probabilities\": { \"Gas\": 0.62 },\n      \"confidence\": 0.9\n    }\n  }\n}";
+        assert!((pick_probability(pretty) - 0.62).abs() < 1e-9);
+        assert_eq!(pick_probability("not json"), 0.0);
+        assert_eq!(pick_probability(""), 0.0);
     }
 }

@@ -1,6 +1,6 @@
 //! Categories, budgets, rules, splits, transfers, bulk edits.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 
 use chrono::{Datelike, TimeZone, Utc};
 use regex::Regex;
@@ -229,7 +229,7 @@ pub struct Txn {
     /// `user`, `rule`, `memory`, or `ai`. `None` when nothing set the category.
     pub categorized_by: Option<String>,
     /// When the last AI attempt on this row errored. Such rows are skipped by the after-sync
-    /// pass and the on-screen bulk button until "Ask AI" or Setup → AI retries them.
+    /// pass and the bulk runs until "Ask AI" retries them or the AI settings change.
     pub ai_failed_at: Option<i64>,
 }
 
@@ -243,6 +243,8 @@ pub struct AiRecord {
     /// Looked up now; `None` when the category is gone or the answer was "other".
     pub category_name: Option<String>,
     pub confidence: f64,
+    /// The picked choice's probability; 0 when the response had none.
+    pub probability: f64,
     pub provider: String,
     pub asked_at: i64,
     /// Empty for answers recorded before exchanges were kept.
@@ -1486,6 +1488,29 @@ impl Store {
         Ok(())
     }
 
+    /// Let every uncategorized row be tried again after the AI settings changed: clear the
+    /// failure flag and forget cached answers (below threshold or "other") for their payees.
+    /// Answers for payees with no uncategorized rows are kept.
+    pub fn reset_ai_attempts(&self) -> Result<(), Error> {
+        self.conn().execute(
+            "UPDATE transactions SET ai_failed_at=NULL
+             WHERE category_id IS NULL AND ai_failed_at IS NOT NULL",
+            [],
+        )?;
+        let keys: HashSet<String> = self
+            .list_ai_candidates(true)?
+            .into_iter()
+            .map(|(_, payee, _)| normalize_payee(&payee))
+            .collect();
+        for key in keys {
+            self.conn().execute(
+                "DELETE FROM ai_answers WHERE normalized_payee=?1",
+                params![key],
+            )?;
+        }
+        Ok(())
+    }
+
     /// What the AI pass would send for one transaction, whatever its state: (payee, amount).
     /// `None` when the row is gone. Used by the debug trace.
     pub fn ai_input_for(&self, txn_id: &str) -> Result<Option<(String, i64)>, Error> {
@@ -1500,20 +1525,21 @@ impl Store {
             .optional()?)
     }
 
-    /// Cached AI answer for a normalized payee: (category_id or None for "other", confidence).
+    /// Cached AI answer for a normalized payee: (category_id or None for "other", confidence,
+    /// probability of the pick).
     /// A recorded failure is not an answer, and neither is one saved before exchanges were
     /// kept (`exchanges IS NULL`): both make the payee get asked again, so the trace fills in.
     pub fn ai_answer(
         &self,
         normalized_payee: &str,
-    ) -> Result<Option<(Option<String>, f64)>, Error> {
+    ) -> Result<Option<(Option<String>, f64, f64)>, Error> {
         Ok(self
             .conn()
             .query_row(
-                "SELECT category_id, confidence FROM ai_answers
+                "SELECT category_id, confidence, probability FROM ai_answers
                  WHERE normalized_payee=?1 AND error IS NULL AND exchanges IS NOT NULL",
                 params![normalized_payee],
-                |r| Ok((r.get(0)?, r.get(1)?)),
+                |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
             )
             .optional()?)
     }
@@ -1525,18 +1551,20 @@ impl Store {
         normalized_payee: &str,
         category_id: Option<&str>,
         confidence: f64,
+        probability: f64,
         provider: &str,
         exchanges: &[AiExchange],
     ) -> Result<(), Error> {
         let exchanges_json = serde_json::to_string(exchanges)
             .map_err(|_| Error::user("Could not record the AI exchange."))?;
         self.conn().execute(
-            "INSERT INTO ai_answers (normalized_payee, category_id, confidence, provider, asked_at, exchanges, error)
-             VALUES (?1, ?2, ?3, ?4, unixepoch(), ?5, NULL)
+            "INSERT INTO ai_answers (normalized_payee, category_id, confidence, probability, provider, asked_at, exchanges, error)
+             VALUES (?1, ?2, ?3, ?4, ?5, unixepoch(), ?6, NULL)
              ON CONFLICT(normalized_payee) DO UPDATE SET category_id=excluded.category_id,
-                confidence=excluded.confidence, provider=excluded.provider, asked_at=excluded.asked_at,
+                confidence=excluded.confidence, probability=excluded.probability,
+                provider=excluded.provider, asked_at=excluded.asked_at,
                 exchanges=excluded.exchanges, error=NULL",
-            params![normalized_payee, category_id, confidence, provider, exchanges_json],
+            params![normalized_payee, category_id, confidence, probability, provider, exchanges_json],
         )?;
         Ok(())
     }
@@ -1556,7 +1584,7 @@ impl Store {
         self.conn().execute(
             "INSERT INTO ai_answers (normalized_payee, category_id, confidence, provider, asked_at, exchanges, error)
              VALUES (?1, NULL, 0, ?2, unixepoch(), ?3, ?4)
-             ON CONFLICT(normalized_payee) DO UPDATE SET category_id=NULL, confidence=0,
+             ON CONFLICT(normalized_payee) DO UPDATE SET category_id=NULL, confidence=0, probability=0,
                 provider=excluded.provider, asked_at=excluded.asked_at,
                 exchanges=excluded.exchanges, error=excluded.error",
             params![normalized_payee, provider, exchanges_json, error],
@@ -1574,7 +1602,7 @@ impl Store {
         let row = self
             .conn()
             .query_row(
-                "SELECT category_id, confidence, provider, asked_at, exchanges, error
+                "SELECT category_id, confidence, provider, asked_at, exchanges, error, probability
                  FROM ai_answers WHERE normalized_payee=?1",
                 params![key],
                 |r| {
@@ -1583,6 +1611,7 @@ impl Store {
                         category_id: r.get(0)?,
                         category_name: None,
                         confidence: r.get(1)?,
+                        probability: r.get(6)?,
                         provider: r.get(2)?,
                         asked_at: r.get(3)?,
                         exchanges: Vec::new(),

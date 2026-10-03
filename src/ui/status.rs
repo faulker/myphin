@@ -32,6 +32,8 @@ pub struct Toast {
     pub id: u64,
     pub message: String,
     pub undo: Option<Undo>,
+    /// A transaction id the toast's "Show" link opens in Activity → All.
+    pub link: Option<String>,
 }
 
 /// One line of the session log. `undo` is taken once it is used, and `undone` marks that.
@@ -58,6 +60,16 @@ impl StatusState {
 
     /// Like [`push`](Self::push), with a change the user can reverse from the toast or the log.
     pub fn push_with(&mut self, message: String, undo: Option<Undo>) -> u64 {
+        self.push_full(message, undo, None)
+    }
+
+    /// Like [`push`](Self::push), with a "Show" link to transaction `txn_id`.
+    pub fn push_linked(&mut self, message: String, txn_id: String) -> u64 {
+        self.push_full(message, None, Some(txn_id))
+    }
+
+    /// Shared body of the push methods.
+    fn push_full(&mut self, message: String, undo: Option<Undo>, link: Option<String>) -> u64 {
         self.next_id += 1;
         let id = self.next_id;
         self.log.push(LogEntry {
@@ -66,7 +78,12 @@ impl StatusState {
             undo: undo.clone(),
             undone: false,
         });
-        self.toast = Some(Toast { id, message, undo });
+        self.toast = Some(Toast {
+            id,
+            message,
+            undo,
+            link,
+        });
         id
     }
 
@@ -98,6 +115,19 @@ impl StatusState {
 /// Push a status message. The toast hides itself when its timer bar runs out.
 pub fn push_status(mut status: Signal<StatusState>, message: impl Into<String>) {
     status.write().push(message.into());
+}
+
+/// Push a status message, with a "Show" link to `txn_id` when there is one.
+pub fn push_maybe_linked(
+    mut status: Signal<StatusState>,
+    message: impl Into<String>,
+    txn_id: Option<String>,
+) {
+    let message = message.into();
+    match txn_id {
+        Some(id) => status.write().push_linked(message, id),
+        None => status.write().push(message),
+    };
 }
 
 /// Push a status message for a change the user can undo from the toast or Setup → Log.
@@ -165,6 +195,17 @@ mod tests {
         assert!(entry.undo.is_none());
         assert!(s.toast.as_ref().unwrap().undo.is_none());
         assert_eq!(s.take_undo(99), None);
+    }
+
+    #[test]
+    fn push_linked_carries_the_txn_id_on_the_toast_only() {
+        let mut s = StatusState::default();
+        s.push_linked("AI categorized X as Food.".into(), "t1".into());
+        let t = s.toast.as_ref().unwrap();
+        assert_eq!(t.link.as_deref(), Some("t1"));
+        assert!(t.undo.is_none());
+        s.push("next".into());
+        assert!(s.toast.as_ref().unwrap().link.is_none());
     }
 
     #[test]

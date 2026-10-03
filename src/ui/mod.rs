@@ -88,6 +88,8 @@ pub fn App() -> Element {
     let syncing = use_signal(|| None::<String>);
     // How far Activity was scrolled when the user last left it, restored on return.
     let mut activity_scroll = use_signal(|| 0.0f64);
+    // A transaction a toast's "Show" link asked Activity to open; Activity clears it once handled.
+    let focus_txn = use_signal(|| None::<String>);
     let _ = nonce();
 
     // Leave Activity for another screen, noting the scroll offset first so coming back lands in the same spot.
@@ -220,12 +222,12 @@ pub fn App() -> Element {
                 main { class: "body",
                     match *screen.read() {
                         Screen::Month => rsx! { month::MonthView { store, screen, filter, nonce, status, activity_scroll } },
-                        Screen::Activity => rsx! { activity::ActivityView { store, filter, nonce, status, syncing, scroll: activity_scroll } },
+                        Screen::Activity => rsx! { activity::ActivityView { store, filter, nonce, status, syncing, scroll: activity_scroll, show_txn: focus_txn } },
                         Screen::Categories => rsx! { categories::CategoriesView { store, nonce, status } },
                         Screen::Setup => rsx! { setup::SetupView { store, nonce, status, syncing, theme } },
                     }
                 }
-                Toast { store, status, nonce }
+                Toast { store, status, nonce, screen, filter, focus_txn }
             }
         }
         }
@@ -234,14 +236,21 @@ pub fn App() -> Element {
 
 /// Floating status popup. A bar along its bottom edge shrinks over the timeout saved in
 /// Setup → Log and hides the toast when it runs out; hovering pauses it. Close dismisses
-/// without touching the log. Undo reverses the change it reports, when there is one.
+/// without touching the log. Undo reverses the change it reports, when there is one. Show
+/// opens the transaction it names in Activity → All, expanded.
 #[component]
 fn Toast(
     store: Signal<Option<SharedStore>>,
     status: Signal<StatusState>,
     nonce: Signal<u64>,
+    screen: Signal<Screen>,
+    filter: Signal<TxnQuery>,
+    focus_txn: Signal<Option<String>>,
 ) -> Element {
     let mut status = status;
+    let mut screen = screen;
+    let mut filter = filter;
+    let mut focus_txn = focus_txn;
     let _ = nonce();
     let base = store()
         .and_then(|s| s.lock().ok().and_then(|g| g.status_timeout_secs().ok()))
@@ -257,6 +266,20 @@ fn Toast(
                 role: "status",
                 title: "Hover to keep this open",
                 p { "{toast.message}" }
+                if let Some(txn_id) = toast.link.clone() {
+                    button {
+                        class: "toast-link",
+                        title: "Open this transaction in Activity",
+                        onclick: move |_| {
+                            // All with no month, account, or search, so the row is sure to be listed.
+                            filter.set(activity_scope_query("all"));
+                            focus_txn.set(Some(txn_id.clone()));
+                            screen.set(Screen::Activity);
+                            status.write().dismiss();
+                        },
+                        "Show"
+                    }
+                }
                 if toast.undo.is_some() {
                     button {
                         class: "toast-undo",

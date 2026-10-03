@@ -7,7 +7,10 @@ use rand::RngCore;
 use rusqlite::{params, Connection, OptionalExtension};
 use uuid::Uuid;
 
-use crate::ai::{AiSecret, AiSettings, DEFAULT_THRESHOLD, LEGACY_LMR_ID};
+use crate::ai::{
+    pick_probability, AiExchange, AiSecret, AiSettings, ScoreCombine,
+    DEFAULT_PROBABILITY_THRESHOLD, DEFAULT_THRESHOLD, LEGACY_LMR_ID,
+};
 use crate::crypto::{self, DataKey};
 use crate::error::Error;
 use crate::providers::{AccountSet, ConnectionSecrets, NormalizedTxn};
@@ -221,20 +224,44 @@ impl Store {
             .and_then(|v| v.parse::<f64>().ok())
             .map(|t| t.clamp(0.0, 1.0))
             .unwrap_or(DEFAULT_THRESHOLD);
+        let use_confidence = get("ai_use_confidence")?.as_deref() != Some("0");
+        let use_probability = get("ai_use_probability")?.as_deref() == Some("1");
+        let probability_threshold = get("ai_probability_threshold")?
+            .and_then(|v| v.parse::<f64>().ok())
+            .map(|t| t.clamp(0.0, 1.0))
+            .unwrap_or(DEFAULT_PROBABILITY_THRESHOLD);
+        let combine = get("ai_combine")?
+            .map(|c| ScoreCombine::parse(&c))
+            .unwrap_or_default();
         let after_sync = get("ai_after_sync")?.as_deref() == Some("1");
         let endpoint = get("ai_endpoint")?.filter(|e| !e.trim().is_empty());
         let ca_cert = get("ai_ca_cert")?.filter(|c| !c.trim().is_empty());
+        let model = get("ai_model")?.filter(|m| !m.trim().is_empty());
         Ok(AiSettings {
             provider,
             api_key,
             endpoint,
             ca_cert,
+            model,
+            use_confidence,
             threshold,
+            use_probability,
+            probability_threshold,
+            combine,
             after_sync,
         })
     }
 
+    /// Save the AI settings. When the AI itself changes (provider, key, server URL,
+    /// certificate, or model), uncategorized rows it already tried become eligible again.
     pub fn set_ai_settings(&self, settings: &AiSettings) -> Result<(), Error> {
+        let old = self.ai_settings()?;
+        let norm = |v: &Option<String>| v.as_deref().unwrap_or("").trim().to_string();
+        let ai_changed = old.provider != settings.provider
+            || old.api_key.0.trim() != settings.api_key.0.trim()
+            || norm(&old.endpoint) != norm(&settings.endpoint)
+            || norm(&old.ca_cert) != norm(&settings.ca_cert)
+            || norm(&old.model) != norm(&settings.model);
         let pairs = [
             ("ai_provider", settings.provider.clone().unwrap_or_default()),
             ("ai_api_key", settings.api_key.0.trim().to_string()),
@@ -242,6 +269,19 @@ impl Store {
                 "ai_threshold",
                 format!("{:.4}", settings.threshold.clamp(0.0, 1.0)),
             ),
+            (
+                "ai_use_confidence",
+                if settings.use_confidence { "1" } else { "0" }.to_string(),
+            ),
+            (
+                "ai_use_probability",
+                if settings.use_probability { "1" } else { "0" }.to_string(),
+            ),
+            (
+                "ai_probability_threshold",
+                format!("{:.4}", settings.probability_threshold.clamp(0.0, 1.0)),
+            ),
+            ("ai_combine", settings.combine.as_str().to_string()),
             (
                 "ai_after_sync",
                 if settings.after_sync { "1" } else { "0" }.to_string(),
@@ -259,6 +299,10 @@ impl Store {
                 "ai_ca_cert",
                 settings.ca_cert.as_deref().unwrap_or("").trim().to_string(),
             ),
+            (
+                "ai_model",
+                settings.model.as_deref().unwrap_or("").trim().to_string(),
+            ),
         ];
         for (k, v) in pairs {
             self.conn.execute(
@@ -266,6 +310,9 @@ impl Store {
                  ON CONFLICT(key) DO UPDATE SET value=excluded.value",
                 params![k, v],
             )?;
+        }
+        if ai_changed {
+            self.reset_ai_attempts()?;
         }
         self.persist()
     }
@@ -799,6 +846,7 @@ fn migrate(conn: &Connection) -> Result<(), Error> {
     migrate_v8(conn)?;
     migrate_v9(conn)?;
     migrate_v10(conn)?;
+    migrate_v11(conn)?;
     Ok(())
 }
 
@@ -971,6 +1019,51 @@ fn migrate_v10(conn: &Connection) -> Result<(), Error> {
     Ok(())
 }
 
+/// Schema 10 → 11: `ai_answers.probability` keeps the picked choice's probability so the
+/// probability gate can judge cached answers. Rows added before it are backfilled from the
+/// last recorded response, so they do not need to be asked again. Idempotent.
+fn migrate_v11(conn: &Connection) -> Result<(), Error> {
+    if !has_column(conn, "ai_answers", "probability")? {
+        conn.execute_batch(
+            "ALTER TABLE ai_answers ADD COLUMN probability REAL NOT NULL DEFAULT 0;",
+        )?;
+        backfill_ai_probability(conn)?;
+    }
+    conn.execute("UPDATE meta SET value='11' WHERE key='schema'", [])?;
+    Ok(())
+}
+
+/// Fill `ai_answers.probability` from each answer's last recorded response. Rows without a
+/// readable trail keep 0.
+fn backfill_ai_probability(conn: &Connection) -> Result<(), Error> {
+    let rows: Vec<(String, String)> = {
+        let mut stmt = conn.prepare(
+            "SELECT normalized_payee, exchanges FROM ai_answers
+             WHERE exchanges IS NOT NULL AND error IS NULL",
+        )?;
+        let rows = stmt
+            .query_map([], |r| Ok((r.get(0)?, r.get(1)?)))?
+            .collect::<Result<_, _>>()?;
+        rows
+    };
+    for (payee, exchanges) in rows {
+        let Ok(exchanges) = serde_json::from_str::<Vec<AiExchange>>(&exchanges) else {
+            continue;
+        };
+        let Some(last) = exchanges.last() else {
+            continue;
+        };
+        let p = pick_probability(&last.response);
+        if p > 0.0 {
+            conn.execute(
+                "UPDATE ai_answers SET probability=?1 WHERE normalized_payee=?2",
+                params![p, payee],
+            )?;
+        }
+    }
+    Ok(())
+}
+
 /// Pretty-print stored JSON; anything that is not JSON comes back as it was.
 fn pretty_json(s: &str) -> String {
     match serde_json::from_str::<serde_json::Value>(s) {
@@ -1105,7 +1198,7 @@ mod tests {
             })
             .unwrap();
         assert_eq!(send_to_ai, 1);
-        assert_eq!(schema, "10");
+        assert_eq!(schema, "11");
     }
 
     fn one_txn_set(remote_id: &str, raw: Option<&str>, acc_raw: Option<&str>) -> AccountSet {
@@ -1354,9 +1447,14 @@ mod tests {
         assert!(s.provider.is_none());
         assert!(s.api_key.is_empty());
         assert!((s.threshold - 0.70).abs() < 1e-9);
+        assert!(s.use_confidence);
+        assert!(!s.use_probability);
+        assert!((s.probability_threshold - 0.30).abs() < 1e-9);
+        assert_eq!(s.combine, ScoreCombine::Any);
         assert!(!s.after_sync);
         assert!(s.endpoint.is_none());
         assert!(s.ca_cert.is_none());
+        assert!(s.model.is_none());
         assert!(!s.is_configured());
 
         store
@@ -1365,30 +1463,42 @@ mod tests {
                 api_key: AiSecret(" sk-1 ".into()),
                 endpoint: Some(" https://laya.home:8321 ".into()),
                 ca_cert: Some("-----BEGIN CERTIFICATE-----\nabc\n-----END CERTIFICATE-----".into()),
+                model: Some(" winnow:e4b ".into()),
+                use_confidence: false,
                 threshold: 1.5,
+                use_probability: true,
+                probability_threshold: -0.2,
+                combine: ScoreCombine::All,
                 after_sync: true,
             })
             .unwrap();
         let s = store.ai_settings().unwrap();
+        assert!(!s.use_confidence);
+        assert!(s.use_probability);
+        assert_eq!(s.probability_threshold, 0.0);
+        assert_eq!(s.combine, ScoreCombine::All);
         assert_eq!(s.provider.as_deref(), Some("typesafe"));
         assert_eq!(s.api_key.0, "sk-1");
         assert_eq!(s.endpoint.as_deref(), Some("https://laya.home:8321"));
         assert!(s.ca_cert.as_deref().unwrap().starts_with("-----BEGIN"));
+        assert_eq!(s.model.as_deref(), Some("winnow:e4b"));
         assert!((s.threshold - 1.0).abs() < 1e-9);
         assert!(s.after_sync);
         assert!(s.is_configured());
 
-        // Blank endpoint and certificate read back as None.
+        // Blank endpoint, certificate, and model read back as None.
         store
             .set_ai_settings(&AiSettings {
                 endpoint: Some("  ".into()),
                 ca_cert: None,
+                model: Some(" ".into()),
                 ..s.clone()
             })
             .unwrap();
         let s = store.ai_settings().unwrap();
         assert!(s.endpoint.is_none());
         assert!(s.ca_cert.is_none());
+        assert!(s.model.is_none());
 
         // Clearing the provider turns the feature off again.
         store
@@ -1398,6 +1508,46 @@ mod tests {
             })
             .unwrap();
         assert!(!store.ai_settings().unwrap().is_configured());
+    }
+
+    #[test]
+    fn migrate_v11_backfills_probability_from_the_trail() {
+        let conn = Connection::open_in_memory().unwrap();
+        migrate(&conn).unwrap();
+        // Pretend these rows predate the column.
+        conn.execute_batch("ALTER TABLE ai_answers DROP COLUMN probability;")
+            .unwrap();
+        let trail = serde_json::to_string(&vec![AiExchange {
+            method: "POST".into(),
+            url: "https://x".into(),
+            request: "{}".into(),
+            status: Some(200),
+            response: r#"{"answers":{"category":{"choice":"Shopping","probabilities":{"Shopping":0.35,"other":0.2},"confidence":0.4}}}"#.into(),
+        }])
+        .unwrap();
+        conn.execute(
+            "INSERT INTO ai_answers (normalized_payee, category_id, confidence, provider, asked_at, exchanges)
+             VALUES ('target', 'c1', 0.4, 'typesafe', 1, ?1), ('old', NULL, 0.3, 'typesafe', 1, NULL)",
+            [trail],
+        )
+        .unwrap();
+        migrate(&conn).unwrap();
+        let p = |payee: &str| -> f64 {
+            conn.query_row(
+                "SELECT probability FROM ai_answers WHERE normalized_payee=?1",
+                [payee],
+                |r| r.get(0),
+            )
+            .unwrap()
+        };
+        assert!((p("target") - 0.35).abs() < 1e-9);
+        assert_eq!(p("old"), 0.0);
+        let schema: String = conn
+            .query_row("SELECT value FROM meta WHERE key='schema'", [], |r| {
+                r.get(0)
+            })
+            .unwrap();
+        assert_eq!(schema, "11");
     }
 
     #[test]

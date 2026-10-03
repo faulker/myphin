@@ -376,6 +376,7 @@ mod tests {
             guess: Some(CategoryGuess {
                 category_id: Some("c1".into()),
                 confidence: 0.91,
+                probability: 0.71,
             }),
             category_name: Some("Dining".into()),
             top_rating: Some(("Dining".into(), 0.71)),
@@ -412,6 +413,7 @@ mod tests {
         t.guess = Some(CategoryGuess {
             category_id: None,
             confidence: 0.4,
+            probability: 0.4,
         });
         t.top_rating = Some(("other".into(), 0.4));
         t.elapsed = Duration::from_millis(800);

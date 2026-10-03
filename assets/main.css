@@ -312,8 +312,8 @@ label { color: var(--muted); font-size: 0.85rem; }
 }
 .toast-close { background: transparent; border: 0; color: var(--muted); padding: 0; min-height: 0; font-size: 0.8rem; }
 .toast-close:hover { color: var(--ink); }
-.toast-undo { background: transparent; border: 0; color: var(--accent); padding: 0; min-height: 0; font-size: 0.85rem; font-weight: 600; }
-.toast-undo:hover { text-decoration: underline; }
+.toast-undo, .toast-link { background: transparent; border: 0; color: var(--accent); padding: 0; min-height: 0; font-size: 0.85rem; font-weight: 600; }
+.toast-undo:hover, .toast-link:hover { text-decoration: underline; }
 @keyframes toast-in {
   from { opacity: 0; transform: translateY(0.35rem); }
   to { opacity: 1; transform: none; }
@@ -562,8 +562,20 @@ button.sub.on { color: var(--ink); box-shadow: inset 0 -2px 0 var(--accent); }
   flex-direction: column;
   gap: var(--s2);
 }
-.card.form { gap: var(--s2); }
+.card.form { gap: var(--s4); }
 .card.form label { margin-top: var(--s1); }
+/* One setting: label, control, and its hints stay tight so each hint reads as belonging to it. */
+.field { display: flex; flex-direction: column; gap: var(--s1); }
+.field > label { margin-top: 0; }
+.field > .hint { margin: 0; }
+/* A titled group of settings inside a form card, ruled off from the group above. */
+.group { display: flex; flex-direction: column; gap: var(--s3); }
+.group + .group { border-top: 1px solid var(--line); padding-top: var(--s4); }
+.group > h3 { font-size: 0.8rem; letter-spacing: 0.08em; text-transform: uppercase; color: var(--muted); }
+.group > h3 + .hint { margin: calc(-1 * var(--s2)) 0 0; }
+.card.form .row.gate { gap: var(--s2); }
+.card.form .row.gate > label.check { margin-top: 0; }
+.form-actions { border-top: 1px solid var(--line); padding-top: var(--s3); }
 .card.form label.check { display: flex; gap: var(--s2); align-items: center; cursor: pointer; }
 .card.form input.cap-input { width: 5.5rem; }
 .card.form .row > input.cap-input { flex: 0 0 5.5rem; }

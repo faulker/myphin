@@ -147,8 +147,10 @@ pub fn ActivityView(
     status: Signal<StatusState>,
     syncing: Signal<Option<String>>,
     scroll: Signal<f64>,
+    show_txn: Signal<Option<String>>,
 ) -> Element {
     let mut filter = filter;
+    let mut show_txn = show_txn;
     let status = status;
     let mut cursor = use_signal(|| 0usize);
     // Set right before a cursor move that should scroll the row into view, so mounting alone never scrolls.
@@ -193,6 +195,22 @@ pub fn ActivityView(
         cursor.set(txns.len() - 1);
     }
 
+    // A toast's "Show" link: put the cursor on that row, open its editor, and bring it into view.
+    if let Some(id) = show_txn() {
+        show_txn.set(None);
+        if let Some(i) = txns.iter().position(|t| t.id == id) {
+            cursor.set(i);
+            selected.set(Vec::new());
+            expanded.set(Some(id));
+            // Two frames on, so this runs after the editor renders and after the mount-time
+            // scroll restore below.
+            document::eval(
+                "requestAnimationFrame(() => requestAnimationFrame(() => \
+                 document.querySelector('.txns .txn.cur')?.scrollIntoView({ block: 'center' })));",
+            );
+        }
+    }
+
     let f = filter();
     let typed_now = typed();
     let hint = match_category_typeahead(&typed_now, &cats).map(|c| c.label());
@@ -216,7 +234,7 @@ pub fn ActivityView(
 
     let groups = group_rows(&txns);
     // Rows on screen the AI could fill in, behind the "Categorize with AI" button. Rows whose
-    // last attempt failed are left to "Ask AI" on the row itself or Setup → AI.
+    // last attempt failed are left to "Ask AI" on the row itself.
     let ai_ids: Vec<String> = txns
         .iter()
         .filter(|t| ai_candidate(t) && t.ai_failed_at.is_none())
@@ -633,7 +651,7 @@ pub fn ActivityView(
                         title: "Send the uncategorized rows shown here to the AI",
                         onclick: {
                             let ids = ai_ids.clone();
-                            move |_| start_ai_run(store, Some(ids.clone()), syncing, status, nonce)
+                            move |_| start_ai_run(store, Some(ids.clone()), false, syncing, status, nonce)
                         },
                         if ai_busy {
                             "Asking…"
@@ -1101,7 +1119,7 @@ fn RowEditor(
                                     title: "Send just this row to the AI",
                                     onclick: {
                                         let id = txn.id.clone();
-                                        move |_| start_ai_run(store, Some(vec![id.clone()]), syncing, status, nonce)
+                                        move |_| start_ai_run(store, Some(vec![id.clone()]), true, syncing, status, nonce)
                                     },
                                     if syncing.read().as_deref() == Some(super::AI_BUSY) {
                                         "Asking…"
@@ -1113,7 +1131,7 @@ fn RowEditor(
                         }
                         if ai_ready && ai_candidate(&txn) && txn.ai_failed_at.is_some() {
                             span { class: "hint",
-                                "The AI failed on this row earlier. It is skipped after syncs until you ask again."
+                                "The AI failed on this row earlier. Syncs and bulk runs skip it until you ask again or change the AI settings."
                             }
                         }
                     }
@@ -1621,17 +1639,24 @@ fn AiTracePanel(store: Signal<Option<SharedStore>>, txn_id: String, nonce: Signa
     }
 }
 
-/// "Picked Dining at 91% confidence.", "Picked other (nothing fits) at 40% confidence.", or
-/// the error when the last call failed.
+/// "Picked Dining at 91% confidence.", with ", 35% probability" added when the response
+/// scored the pick, "Picked other (nothing fits) at 40% confidence.", or the error when the
+/// last call failed.
 fn ai_record_outcome(r: &AiRecord) -> String {
     if let Some(e) = &r.error {
         return format!("Failed: {e} Ask AI on this row or run Setup → AI to retry.");
     }
     let pct = (r.confidence * 100.0).round() as i64;
+    let scores = if r.probability > 0.0 {
+        let prob = (r.probability * 100.0).round() as i64;
+        format!("{pct}% confidence, {prob}% probability")
+    } else {
+        format!("{pct}% confidence")
+    };
     match (&r.category_id, &r.category_name) {
-        (Some(_), Some(name)) => format!("Picked {name} at {pct}% confidence."),
-        (Some(_), None) => format!("Picked a category that no longer exists at {pct}% confidence."),
-        (None, _) => format!("Picked other (nothing fits) at {pct}% confidence."),
+        (Some(_), Some(name)) => format!("Picked {name} at {scores}."),
+        (Some(_), None) => format!("Picked a category that no longer exists at {scores}."),
+        (None, _) => format!("Picked other (nothing fits) at {scores}."),
     }
 }
 
@@ -1807,6 +1832,7 @@ mod tests {
             category_id: category_id.map(String::from),
             category_name: name.map(String::from),
             confidence: 0.905,
+            probability: 0.0,
             provider: "typesafe".into(),
             asked_at: 0,
             exchanges: vec![],
@@ -1823,6 +1849,14 @@ mod tests {
         assert_eq!(
             ai_record_outcome(&rec(None, None)),
             "Picked other (nothing fits) at 91% confidence."
+        );
+        let scored = AiRecord {
+            probability: 0.35,
+            ..rec(Some("c1"), Some("Shopping"))
+        };
+        assert_eq!(
+            ai_record_outcome(&scored),
+            "Picked Shopping at 91% confidence, 35% probability."
         );
         let failed = AiRecord {
             error: Some("AI key was rejected.".into()),

@@ -2,9 +2,9 @@ use dioxus::prelude::*;
 
 use super::{TraceExchange, AI_BUSY};
 use crate::ui::relative_time;
-use crate::ui::status::{push_status, StatusState};
+use crate::ui::status::{push_maybe_linked, push_status, StatusState};
 use crate::SharedStore;
-use myphin::ai::{self, AiSecret, AiSettings, AiTrace, Direction};
+use myphin::ai::{self, AiSecret, AiSettings, AiTrace, Direction, ScoreCombine};
 use myphin::domain::Txn;
 use myphin::money::format_cents;
 use myphin::providers::{
@@ -118,8 +118,8 @@ fn Connections(
                 .unwrap_or_else(|_| Err("Sync failed.".into()));
             match result {
                 Ok(msg) => {
-                    let note = after_sync_phase(shared, syncing).await;
-                    push_status(status, format!("{msg}{note}"));
+                    let (note, link) = after_sync_phase(shared, syncing).await;
+                    push_maybe_linked(status, format!("{msg}{note}"), link);
                     token.set(String::new());
                     show_add.set(false);
                 }
@@ -245,18 +245,22 @@ fn Connections(
                         a { href: "https://bridge.simplefin.org/simplefin/create", "bridge.simplefin.org" }
                         ", paste it here, and Myphin pulls the last few months. Your bank password never touches this app."
                     }
-                    label { r#for: "sf-token", "Setup token" }
-                    textarea {
-                        id: "sf-token",
-                        value: "{token}",
-                        oninput: move |e| token.set(e.value()),
-                        placeholder: "Paste the token",
-                        spellcheck: "false",
-                        autocomplete: "off",
-                        rows: "3",
+                    div { class: "field",
+                        label { r#for: "sf-token", "Setup token" }
+                        textarea {
+                            id: "sf-token",
+                            value: "{token}",
+                            oninput: move |e| token.set(e.value()),
+                            placeholder: "Paste the token",
+                            spellcheck: "false",
+                            autocomplete: "off",
+                            rows: "3",
+                        }
                     }
-                    label { r#for: "sf-name", "Name" }
-                    input { id: "sf-name", value: "{conn_name}", oninput: move |e| conn_name.set(e.value()), placeholder: "SimpleFIN" }
+                    div { class: "field",
+                        label { r#for: "sf-name", "Name" }
+                        input { id: "sf-name", value: "{conn_name}", oninput: move |e| conn_name.set(e.value()), placeholder: "SimpleFIN" }
+                    }
                     div { class: "row",
                         button {
                             class: "primary",
@@ -296,7 +300,13 @@ fn AiSetup(
     let mut key = use_signal(String::new);
     let mut endpoint = use_signal(|| saved.endpoint.clone().unwrap_or_default());
     let mut ca_cert = use_signal(|| saved.ca_cert.clone().unwrap_or_default());
+    let mut model = use_signal(|| saved.model.clone().unwrap_or_default());
+    let mut use_confidence = use_signal(|| saved.use_confidence);
     let mut threshold = use_signal(|| format!("{}", (saved.threshold * 100.0).round() as i64));
+    let mut use_probability = use_signal(|| saved.use_probability);
+    let mut prob_threshold =
+        use_signal(|| format!("{}", (saved.probability_threshold * 100.0).round() as i64));
+    let mut combine = use_signal(|| saved.combine);
     let mut after_sync = use_signal(|| saved.after_sync);
     let has_key = !saved.api_key.is_empty();
     let configured = saved.is_configured();
@@ -317,16 +327,28 @@ fn AiSetup(
     let warning = selected.and_then(|p| p.warning());
     let link = selected.and_then(|p| p.link());
     let default_endpoint = selected.and_then(|p| p.default_endpoint());
+    let default_model = selected.and_then(|p| p.default_model());
 
     let save = move |_| {
         let Some(s) = store() else {
             push_status(status, "Locked");
             return;
         };
+        if !use_confidence() && !use_probability() {
+            push_status(status, "Turn on at least one score.");
+            return;
+        }
         let pct = match threshold.read().trim().parse::<f64>() {
             Ok(p) if (0.0..=100.0).contains(&p) => p,
             _ => {
-                push_status(status, "Threshold must be a number from 0 to 100.");
+                push_status(status, "Confidence must be a number from 0 to 100.");
+                return;
+            }
+        };
+        let prob_pct = match prob_threshold.read().trim().parse::<f64>() {
+            Ok(p) if (0.0..=100.0).contains(&p) => p,
+            _ => {
+                push_status(status, "Probability must be a number from 0 to 100.");
                 return;
             }
         };
@@ -359,12 +381,21 @@ fn AiSetup(
         } else {
             (None, None)
         };
+        // Same for the model name: only saved for a provider that lets you pick one.
+        let model = default_model
+            .map(|_| model.read().trim().to_string())
+            .filter(|m| !m.is_empty());
         let settings = AiSettings {
             provider: Some(provider()),
             api_key,
             endpoint,
             ca_cert,
+            model,
+            use_confidence: use_confidence(),
             threshold: pct / 100.0,
+            use_probability: use_probability(),
+            probability_threshold: prob_pct / 100.0,
+            combine: combine(),
             after_sync: after_sync(),
         };
         let result = s.lock().unwrap().set_ai_settings(&settings);
@@ -378,99 +409,205 @@ fn AiSetup(
         }
     };
 
-    let run = move |_| start_ai_run(store, None, syncing, status, nonce);
+    let run = move |_| start_ai_run(store, None, false, syncing, status, nonce);
 
     rsx! {
         section {
             h2 { "AI categorizer" }
             p { class: "lede",
-                "Rows that no rule or remembered payee covers can be sent to an AI service, which picks a category using the descriptions in Categories & Rules. Only the payee and whether money went in or out are sent. Answers under the threshold stay uncategorized."
+                "Rows that no rule or remembered payee covers can be sent to an AI service, which picks a category using the descriptions in Categories & Rules. Only the payee and whether money went in or out are sent. Answers that miss the score you require stay uncategorized."
             }
             div { class: "card form",
-                label { r#for: "ai-provider", "Provider" }
-                select {
-                    id: "ai-provider",
-                    value: "{provider}",
-                    onchange: move |e| provider.set(e.value()),
-                    for p in ai::PROVIDERS.iter() {
-                        option { value: "{p.provider_id()}", selected: provider() == p.provider_id(), "{p.label()}" }
+                div { class: "group",
+                    h3 { "Provider" }
+                    div { class: "field",
+                        label { r#for: "ai-provider", "Service" }
+                        select {
+                            id: "ai-provider",
+                            value: "{provider}",
+                            onchange: move |e| provider.set(e.value()),
+                            for p in ai::PROVIDERS.iter() {
+                                option { value: "{p.provider_id()}", selected: provider() == p.provider_id(), "{p.label()}" }
+                            }
+                        }
+                        if !description.is_empty() {
+                            p { class: "hint",
+                                "{description}"
+                                if let Some((text, url)) = link {
+                                    " "
+                                    a { href: "{url}", "{text}" }
+                                }
+                            }
+                        }
+                        if let Some(warning) = warning {
+                            p { class: "hint warn", "{warning}" }
+                        }
                     }
-                }
-                if !description.is_empty() {
-                    p { class: "hint",
-                        "{description}"
-                        if let Some((text, url)) = link {
-                            " "
-                            a { href: "{url}", "{text}" }
+                    div { class: "field",
+                        label { r#for: "ai-key", "{key_label}" }
+                        input {
+                            id: "ai-key",
+                            r#type: "password",
+                            value: "{key}",
+                            oninput: move |e| key.set(e.value()),
+                            placeholder: if has_key { "****************" } else { "Paste the key" },
+                            autocomplete: "off",
+                            spellcheck: "false",
+                        }
+                        if has_key {
+                            p { class: "hint", "A key is saved. Paste a new one to replace it." }
+                        }
+                        if !key_help.is_empty() {
+                            p { class: "hint", "{key_help}" }
                         }
                     }
                 }
-                if let Some(warning) = warning {
-                    p { class: "hint warn", "{warning}" }
-                }
-                if let Some(default_url) = default_endpoint {
-                    label { r#for: "ai-endpoint", "Server URL" }
-                    input {
-                        id: "ai-endpoint",
-                        r#type: "url",
-                        value: "{endpoint}",
-                        oninput: move |e| endpoint.set(e.value()),
-                        placeholder: "{default_url}",
-                        autocomplete: "off",
-                        spellcheck: "false",
+                if default_endpoint.is_some() || default_model.is_some() {
+                    div { class: "group",
+                        h3 { "Server" }
+                        if let Some(default_url) = default_endpoint {
+                            div { class: "field",
+                                label { r#for: "ai-endpoint", "Server URL" }
+                                input {
+                                    id: "ai-endpoint",
+                                    r#type: "url",
+                                    value: "{endpoint}",
+                                    oninput: move |e| endpoint.set(e.value()),
+                                    placeholder: "{default_url}",
+                                    autocomplete: "off",
+                                    spellcheck: "false",
+                                }
+                                p { class: "hint",
+                                    "Leave blank for {default_url} on this machine. For a server elsewhere, use https, or http on a local network address."
+                                }
+                            }
+                            div { class: "field",
+                                label { r#for: "ai-ca-cert", "Server certificate (PEM, optional)" }
+                                textarea {
+                                    id: "ai-ca-cert",
+                                    rows: "4",
+                                    value: "{ca_cert}",
+                                    oninput: move |e| ca_cert.set(e.value()),
+                                    placeholder: "-----BEGIN CERTIFICATE-----",
+                                    spellcheck: "false",
+                                }
+                                p { class: "hint",
+                                    "Only for a self-signed https server: paste its cert.pem here and it is trusted for this server alone."
+                                }
+                            }
+                        }
+                        if let Some(default_name) = default_model {
+                            div { class: "field",
+                                label { r#for: "ai-model", "Model" }
+                                input {
+                                    id: "ai-model",
+                                    r#type: "text",
+                                    value: "{model}",
+                                    oninput: move |e| model.set(e.value()),
+                                    placeholder: "{default_name}",
+                                    autocomplete: "off",
+                                    spellcheck: "false",
+                                }
+                                p { class: "hint",
+                                    "Leave blank for {default_name}. The name the server knows the model by, for example laya:e4b on Ollaya or jev-latest on typesafe.ai."
+                                }
+                            }
+                        }
                     }
-                    p { class: "hint",
-                        "Leave blank for {default_url} on this machine. For a server elsewhere, use https, or http on a local network address."
+                }
+                div { class: "group",
+                    h3 { "Score gates" }
+                    p { class: "hint", "An answer is applied only when it passes the gates turned on here." }
+                    div { class: "field",
+                        div { class: "row gate",
+                            label { class: "check",
+                                input {
+                                    r#type: "checkbox",
+                                    checked: use_confidence(),
+                                    onchange: move |e| use_confidence.set(e.checked()),
+                                }
+                                " Require confidence of at least"
+                            }
+                            input {
+                                id: "ai-threshold",
+                                class: "num cap-input",
+                                r#type: "number",
+                                min: "0",
+                                max: "100",
+                                step: "1",
+                                disabled: !use_confidence(),
+                                aria_label: "Confidence threshold (%)",
+                                value: "{threshold}",
+                                oninput: move |e| threshold.set(e.value()),
+                            }
+                            span { "%" }
+                        }
+                        p { class: "hint",
+                            "How sure the model is about the one category it picked. 90% means it is very sure; a low number means it was torn between options."
+                        }
                     }
-                    label { r#for: "ai-ca-cert", "Server certificate (PEM, optional)" }
-                    textarea {
-                        id: "ai-ca-cert",
-                        rows: "4",
-                        value: "{ca_cert}",
-                        oninput: move |e| ca_cert.set(e.value()),
-                        placeholder: "-----BEGIN CERTIFICATE-----",
-                        spellcheck: "false",
+                    div { class: "field",
+                        div { class: "row gate",
+                            label { class: "check",
+                                input {
+                                    r#type: "checkbox",
+                                    checked: use_probability(),
+                                    onchange: move |e| use_probability.set(e.checked()),
+                                }
+                                " Require probability of the picked category of at least"
+                            }
+                            input {
+                                id: "ai-prob-threshold",
+                                class: "num cap-input",
+                                r#type: "number",
+                                min: "0",
+                                max: "100",
+                                step: "1",
+                                disabled: !use_probability(),
+                                aria_label: "Probability threshold (%)",
+                                value: "{prob_threshold}",
+                                oninput: move |e| prob_threshold.set(e.value()),
+                            }
+                            span { "%" }
+                        }
+                        p { class: "hint",
+                            "The model scores every category, and the scores add up to 100%. This is the share the picked category got. 30% can still be the top score when the rest are spread thin."
+                        }
                     }
-                    p { class: "hint",
-                        "Only for a self-signed https server: paste its cert.pem here and it is trusted for this server alone."
+                    if use_confidence() && use_probability() {
+                        div { class: "field",
+                            label { r#for: "ai-combine", "When both are on" }
+                            select {
+                                id: "ai-combine",
+                                value: "{combine().as_str()}",
+                                onchange: move |e| combine.set(ScoreCombine::parse(&e.value())),
+                                option { value: "or", selected: combine() == ScoreCombine::Any, "(OR) Require either score to pass" }
+                                option { value: "and", selected: combine() == ScoreCombine::All, "(AND) Require both scores to pass" }
+                            }
+                            p { class: "hint",
+                                if combine() == ScoreCombine::All {
+                                    "The category is applied only when confidence and probability are both at or above their numbers. Stricter, so fewer rows get categorized."
+                                } else {
+                                    "The category is applied when either confidence or probability is at or above its number. Looser, so more rows get categorized."
+                                }
+                            }
+                        }
                     }
                 }
-                label { r#for: "ai-key", "{key_label}" }
-                input {
-                    id: "ai-key",
-                    r#type: "password",
-                    value: "{key}",
-                    oninput: move |e| key.set(e.value()),
-                    placeholder: if has_key { "****************" } else { "Paste the key" },
-                    autocomplete: "off",
-                    spellcheck: "false",
-                }
-                if has_key {
-                    p { class: "hint", "A key is saved. Paste a new one to replace it." }
-                }
-                if !key_help.is_empty() {
-                    p { class: "hint", "{key_help}" }
-                }
-                label { r#for: "ai-threshold", "Accept when confidence is at least (%)" }
-                input {
-                    id: "ai-threshold",
-                    class: "num cap-input",
-                    r#type: "number",
-                    min: "0",
-                    max: "100",
-                    step: "1",
-                    value: "{threshold}",
-                    oninput: move |e| threshold.set(e.value()),
-                }
-                label { class: "check",
-                    input {
-                        r#type: "checkbox",
-                        checked: after_sync(),
-                        onchange: move |e| after_sync.set(e.checked()),
+                div { class: "group",
+                    h3 { "Schedule" }
+                    div { class: "field",
+                        label { class: "check",
+                            input {
+                                r#type: "checkbox",
+                                checked: after_sync(),
+                                onchange: move |e| after_sync.set(e.checked()),
+                            }
+                            " Run after every sync"
+                        }
                     }
-                    " Run after every sync"
                 }
-                div { class: "row",
+                div { class: "row form-actions",
                     button { class: "primary", onclick: save, "Save" }
                 }
             }
@@ -564,28 +701,32 @@ fn AiDebug(
                 strong { "Debug a transaction" }
                 span { class: "hint", "Sends one row to the provider and shows the exact request and response. Nothing is cached or applied." }
             }
-            label { r#for: "ai-debug-search", "Find a transaction" }
-            input {
-                id: "ai-debug-search",
-                r#type: "search",
-                value: "{search}",
-                placeholder: "Payee, notes, or amount",
-                oninput: move |e| search.set(e.value()),
-            }
-            label { r#for: "ai-debug-pick", "Transaction" }
-            select {
-                id: "ai-debug-pick",
-                value: picked().unwrap_or_default(),
-                onchange: move |e| {
-                    let v = e.value();
-                    picked.set(if v.is_empty() { None } else { Some(v) });
-                },
-                option { value: "", selected: !pick_ok,
-                    if rows.is_empty() { "No matching transactions" } else { "Pick a transaction…" }
+            div { class: "field",
+                label { r#for: "ai-debug-search", "Find a transaction" }
+                input {
+                    id: "ai-debug-search",
+                    r#type: "search",
+                    value: "{search}",
+                    placeholder: "Payee, notes, or amount",
+                    oninput: move |e| search.set(e.value()),
                 }
-                for t in rows.iter() {
-                    option { key: "{t.id}", value: "{t.id}", selected: picked().as_deref() == Some(t.id.as_str()),
-                        "{debug_pick_label(t)}"
+            }
+            div { class: "field",
+                label { r#for: "ai-debug-pick", "Transaction" }
+                select {
+                    id: "ai-debug-pick",
+                    value: picked().unwrap_or_default(),
+                    onchange: move |e| {
+                        let v = e.value();
+                        picked.set(if v.is_empty() { None } else { Some(v) });
+                    },
+                    option { value: "", selected: !pick_ok,
+                        if rows.is_empty() { "No matching transactions" } else { "Pick a transaction…" }
+                    }
+                    for t in rows.iter() {
+                        option { key: "{t.id}", value: "{t.id}", selected: picked().as_deref() == Some(t.id.as_str()),
+                            "{debug_pick_label(t)}"
+                        }
                     }
                 }
             }
@@ -642,11 +783,13 @@ fn debug_pick_label(t: &Txn) -> String {
 }
 
 /// Kick off an AI pass from the UI thread. `ids` limits it to those rows (one row, or the rows
-/// on screen); `None` runs every candidate. Marks the AI busy so the top bar shows it, toasts
+/// on screen); `None` runs every candidate. `force` re-asks the provider even for rows tried
+/// before, for the per-row "Ask AI"; mass runs pass `false`. Marks the AI busy so the top bar shows it, toasts
 /// the result, and re-renders when done. Shared by Setup → AI and the Activity screen.
 pub fn start_ai_run(
     store: Signal<Option<SharedStore>>,
     ids: Option<Vec<String>>,
+    force: bool,
     mut syncing: Signal<Option<String>>,
     status: Signal<StatusState>,
     nonce: Signal<u64>,
@@ -658,11 +801,11 @@ pub fn start_ai_run(
     syncing.set(Some(AI_BUSY.into()));
     push_status(status, "Asking the AI…");
     spawn(async move {
-        let result = tokio::task::spawn_blocking(move || run_ai(shared, ids))
+        let result = tokio::task::spawn_blocking(move || run_ai(shared, ids, force))
             .await
             .unwrap_or_else(|_| Err("AI run failed.".into()));
         match result {
-            Ok(msg) => push_status(status, msg),
+            Ok((msg, link)) => push_maybe_linked(status, msg, link),
             Err(e) => push_status(status, e),
         }
         syncing.set(None);
@@ -670,45 +813,54 @@ pub fn start_ai_run(
     });
 }
 
-/// The manual AI pass. Same runtime rule as [`claim_and_sync`].
-fn run_ai(store: SharedStore, ids: Option<Vec<String>>) -> Result<String, String> {
+/// The manual AI pass. Same runtime rule as [`claim_and_sync`]. `force` re-asks the provider
+/// for the given ids even when they were tried before (the per-row "Ask AI").
+/// Returns the toast text and, when exactly one row was categorized, that row's id.
+fn run_ai(
+    store: SharedStore,
+    ids: Option<Vec<String>>,
+    force: bool,
+) -> Result<(String, Option<String>), String> {
     let transport = ReqwestTransport::new().map_err(|e| e.as_user_message())?;
     let st = store.lock().unwrap();
     match ids {
-        Some(ids) => ai::categorize_txns(&st, &transport, &ids),
+        Some(ids) => ai::categorize_txns(&st, &transport, &ids, force),
         None => ai::categorize_uncategorized(&st, &transport),
     }
-    .map(|r| r.summary())
+    .map(|r| (r.summary(), r.single.map(|one| one.txn_id)))
     .map_err(|e| e.as_user_message())
 }
 
 /// The optional AI pass after a sync, run as its own blocking task so the top bar can show
 /// the AI indicator while it works. Returns text to append to the sync toast, empty when the
-/// pass is off or no key is saved.
-async fn after_sync_phase(store: SharedStore, mut syncing: Signal<Option<String>>) -> String {
+/// pass is off or no key is saved, plus the row id when exactly one row was categorized.
+async fn after_sync_phase(
+    store: SharedStore,
+    mut syncing: Signal<Option<String>>,
+) -> (String, Option<String>) {
     let wanted = store
         .lock()
         .ok()
         .and_then(|g| g.ai_settings().ok())
         .is_some_and(|s| s.after_sync && s.is_configured());
     if !wanted {
-        return String::new();
+        return (String::new(), None);
     }
     syncing.set(Some(AI_BUSY.into()));
     tokio::task::spawn_blocking(move || {
         let transport = match ReqwestTransport::new() {
             Ok(t) => t,
-            Err(e) => return format!(" {}", e.as_user_message()),
+            Err(e) => return (format!(" {}", e.as_user_message()), None),
         };
         let st = store.lock().unwrap();
         match ai::run_after_sync(&st, &transport) {
-            Ok(Some(r)) => format!(" {}", r.summary()),
-            Ok(None) => String::new(),
-            Err(e) => format!(" {}", e.as_user_message()),
+            Ok(Some(r)) => (format!(" {}", r.summary()), r.single.map(|one| one.txn_id)),
+            Ok(None) => (String::new(), None),
+            Err(e) => (format!(" {}", e.as_user_message()), None),
         }
     })
     .await
-    .unwrap_or_else(|_| " AI run failed.".into())
+    .unwrap_or_else(|_| (" AI run failed.".into(), None))
 }
 
 /// Every status this session, newest first. Transaction changes carry an Undo button until used.
@@ -750,15 +902,17 @@ fn DebugSetup(
                 "Shows what is under each transaction: the bank's own data for the row and its account, and the exact request and response when the AI categorizer was asked about its payee. Nothing is sent anywhere."
             }
             div { class: "card form",
-                label { class: "check",
-                    input {
-                        r#type: "checkbox",
-                        checked: enabled,
-                        onchange: toggle,
+                div { class: "field",
+                    label { class: "check",
+                        input {
+                            r#type: "checkbox",
+                            checked: enabled,
+                            onchange: toggle,
+                        }
+                        " Show debug views on transactions"
                     }
-                    " Show debug views on transactions"
+                    p { class: "hint", "Adds Raw data and AI trace buttons to the editor of every row in Activity. Raw data fills in on the next sync for rows imported before this version." }
                 }
-                p { class: "hint", "Adds Raw data and AI trace buttons to the editor of every row in Activity. Raw data fills in on the next sync for rows imported before this version." }
             }
         }
     }
@@ -831,37 +985,43 @@ fn Appearance(
                 "The look of this ledger. It stays with the folder, and locking keeps the last choice until the app closes."
             }
             div { class: "card form",
-                label { r#for: "theme", "Theme" }
-                select {
-                    id: "theme",
-                    value: "{current}",
-                    onchange: save,
-                    for (id, label) in myphin::store::THEMES {
-                        option { key: "{id}", value: "{id}", selected: current == *id, "{label}" }
+                div { class: "field",
+                    label { r#for: "theme", "Theme" }
+                    select {
+                        id: "theme",
+                        value: "{current}",
+                        onchange: save,
+                        for (id, label) in myphin::store::THEMES {
+                            option { key: "{id}", value: "{id}", selected: current == *id, "{label}" }
+                        }
                     }
                 }
             }
             div { class: "card form",
-                label { r#for: "open-screen", "Open on" }
-                select {
-                    id: "open-screen",
-                    value: "{open_on}",
-                    onchange: save_open,
-                    for (id, label) in myphin::store::OPEN_SCREENS {
-                        option { key: "{id}", value: "{id}", selected: open_on == *id, "{label}" }
+                div { class: "field",
+                    label { r#for: "open-screen", "Open on" }
+                    select {
+                        id: "open-screen",
+                        value: "{open_on}",
+                        onchange: save_open,
+                        for (id, label) in myphin::store::OPEN_SCREENS {
+                            option { key: "{id}", value: "{id}", selected: open_on == *id, "{label}" }
+                        }
                     }
+                    p { class: "hint", "Used the next time this ledger unlocks." }
                 }
-                p { class: "hint", "Used the next time this ledger unlocks." }
-                label { r#for: "activity-scope", "Activity opens on" }
-                select {
-                    id: "activity-scope",
-                    value: "{activity_on}",
-                    onchange: save_scope,
-                    for (id, label) in myphin::store::ACTIVITY_SCOPES {
-                        option { key: "{id}", value: "{id}", selected: activity_on == *id, "{label}" }
+                div { class: "field",
+                    label { r#for: "activity-scope", "Activity opens on" }
+                    select {
+                        id: "activity-scope",
+                        value: "{activity_on}",
+                        onchange: save_scope,
+                        for (id, label) in myphin::store::ACTIVITY_SCOPES {
+                            option { key: "{id}", value: "{id}", selected: activity_on == *id, "{label}" }
+                        }
                     }
+                    p { class: "hint", "The chip Activity starts on, and what Reset returns to." }
                 }
-                p { class: "hint", "The chip Activity starts on, and what Reset returns to." }
             }
         }
     }
@@ -881,47 +1041,53 @@ fn Passphrase(store: Signal<Option<SharedStore>>, status: Signal<StatusState>) -
                 "Re-encrypts this ledger. A copy under the current passphrase stays in the data folder until you unlock with the new one. A forgotten passphrase still cannot be recovered."
             }
             div { class: "card form",
-                label { r#for: "pass-current", "Current passphrase" }
-                input {
-                    id: "pass-current",
-                    r#type: "password",
-                    value: "{current}",
-                    autocomplete: "current-password",
-                    spellcheck: "false",
-                    oninput: move |e| current.set(e.value()),
-                    onkeydown: move |e| {
-                        if e.key() == Key::Enter {
-                            apply_passphrase(store, status, current, new_pass, confirm);
-                        }
-                    },
+                div { class: "field",
+                    label { r#for: "pass-current", "Current passphrase" }
+                    input {
+                        id: "pass-current",
+                        r#type: "password",
+                        value: "{current}",
+                        autocomplete: "current-password",
+                        spellcheck: "false",
+                        oninput: move |e| current.set(e.value()),
+                        onkeydown: move |e| {
+                            if e.key() == Key::Enter {
+                                apply_passphrase(store, status, current, new_pass, confirm);
+                            }
+                        },
+                    }
                 }
-                label { r#for: "pass-new", "New passphrase" }
-                input {
-                    id: "pass-new",
-                    r#type: "password",
-                    value: "{new_pass}",
-                    autocomplete: "new-password",
-                    spellcheck: "false",
-                    oninput: move |e| new_pass.set(e.value()),
-                    onkeydown: move |e| {
-                        if e.key() == Key::Enter {
-                            apply_passphrase(store, status, current, new_pass, confirm);
-                        }
-                    },
+                div { class: "field",
+                    label { r#for: "pass-new", "New passphrase" }
+                    input {
+                        id: "pass-new",
+                        r#type: "password",
+                        value: "{new_pass}",
+                        autocomplete: "new-password",
+                        spellcheck: "false",
+                        oninput: move |e| new_pass.set(e.value()),
+                        onkeydown: move |e| {
+                            if e.key() == Key::Enter {
+                                apply_passphrase(store, status, current, new_pass, confirm);
+                            }
+                        },
+                    }
                 }
-                label { r#for: "pass-confirm", "Confirm new passphrase" }
-                input {
-                    id: "pass-confirm",
-                    r#type: "password",
-                    value: "{confirm}",
-                    autocomplete: "new-password",
-                    spellcheck: "false",
-                    oninput: move |e| confirm.set(e.value()),
-                    onkeydown: move |e| {
-                        if e.key() == Key::Enter {
-                            apply_passphrase(store, status, current, new_pass, confirm);
-                        }
-                    },
+                div { class: "field",
+                    label { r#for: "pass-confirm", "Confirm new passphrase" }
+                    input {
+                        id: "pass-confirm",
+                        r#type: "password",
+                        value: "{confirm}",
+                        autocomplete: "new-password",
+                        spellcheck: "false",
+                        oninput: move |e| confirm.set(e.value()),
+                        onkeydown: move |e| {
+                            if e.key() == Key::Enter {
+                                apply_passphrase(store, status, current, new_pass, confirm);
+                            }
+                        },
+                    }
                 }
                 div { class: "row",
                     button {
@@ -1129,8 +1295,8 @@ pub fn start_sync(
             .unwrap_or_else(|_| Err("Sync failed.".into()));
         match result {
             Ok(msg) => {
-                let note = after_sync_phase(shared, syncing).await;
-                push_status(status, format!("{msg}{note}"));
+                let (note, link) = after_sync_phase(shared, syncing).await;
+                push_maybe_linked(status, format!("{msg}{note}"), link);
             }
             Err(e) => push_status(status, e),
         }

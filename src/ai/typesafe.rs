@@ -5,7 +5,7 @@
 
 use std::time::Duration;
 
-use super::systemone::post_systemone;
+use super::systemone::{post_systemone, DEFAULT_MODEL};
 use super::{AiSettings, CategorizeInput, Categorizer, CategoryGuess, CategoryOption};
 use crate::error::Error;
 use crate::providers::Transport;
@@ -51,6 +51,7 @@ impl Categorizer for TypesafeAi {
         }
         post_systemone(
             ENDPOINT,
+            DEFAULT_MODEL,
             &settings.api_key,
             None,
             REQUEST_TIMEOUT,

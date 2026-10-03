@@ -1,5 +1,6 @@
 //! The AI pass: ask the configured provider about every row rules and memory left
-//! uncategorized, one call per distinct payee, and apply answers above the threshold.
+//! uncategorized, one call per distinct payee, and apply answers that pass the enabled
+//! confidence and probability gates.
 
 use std::collections::{BTreeMap, HashSet};
 
@@ -18,22 +19,35 @@ pub struct AiRunReport {
     pub asked: u32,
     /// Rows that got a category.
     pub categorized: u32,
-    /// Payees whose best answer was "other" or fell under the threshold.
+    /// Payees whose best answer was "other" or did not pass the score gates.
     pub below_threshold: u32,
     /// Sanitized provider error that stopped the run early, if any.
     pub error: Option<String>,
+    /// Set when exactly one row got a category, so the toast can name it and link to it.
+    pub single: Option<SingleResult>,
+}
+
+/// The one row a run categorized: its id, payee, and the category label it landed on.
+#[derive(Debug, Clone, PartialEq)]
+pub struct SingleResult {
+    pub txn_id: String,
+    pub payee: String,
+    pub category: String,
 }
 
 impl AiRunReport {
     /// One-line toast text.
     pub fn summary(&self) -> String {
-        let mut s = format!(
-            "AI categorized {} row{} across {} payee{}",
-            self.categorized,
-            if self.categorized == 1 { "" } else { "s" },
-            self.payees,
-            if self.payees == 1 { "" } else { "s" }
-        );
+        let mut s = match &self.single {
+            Some(one) => format!("AI categorized {} as {}", one.payee, one.category),
+            None => format!(
+                "AI categorized {} row{} across {} payee{}",
+                self.categorized,
+                if self.categorized == 1 { "" } else { "s" },
+                self.payees,
+                if self.payees == 1 { "" } else { "s" }
+            ),
+        };
         if self.below_threshold > 0 {
             s.push_str(&format!(", {} below threshold", self.below_threshold));
         }
@@ -48,33 +62,37 @@ impl AiRunReport {
 
 /// Run the pass over every candidate row with whatever is configured in Setup → AI, the
 /// Setup → AI button. Errors when nothing is set up. Rows are grouped by normalized payee;
-/// cached answers skip the network. Rows whose last attempt failed are retried here. A
-/// provider error stops the run but keeps what was already applied.
+/// cached answers skip the network. This is a mass run, so rows whose last attempt failed
+/// are left alone like after a sync. A provider error stops the run but keeps what was
+/// already applied.
 pub fn categorize_uncategorized(
     store: &Store,
     transport: &dyn Transport,
 ) -> Result<AiRunReport, Error> {
-    let rows = store.list_ai_candidates(true)?;
-    categorize_rows(store, transport, rows)
+    let rows = store.list_ai_candidates(false)?;
+    categorize_rows(store, transport, rows, false)
 }
 
 /// The same pass limited to the given transaction ids, for one row or the rows on screen.
 /// Ids that are not candidates (already categorized, income, transfer, excluded, hidden) are
-/// skipped, so the report can come back with zero payees. Naming an id is an explicit ask, so
-/// rows flagged as failed are retried. Answers apply only to these ids, never to other rows
-/// sharing the payee.
+/// skipped, so the report can come back with zero payees. `force` is a manual ask for a row
+/// ("Ask AI"): failed rows are retried and the provider is always called, even when the
+/// payee has a cached answer. Without it (the on-screen bulk button) failed rows are skipped
+/// and cached answers are used. Answers apply only to these ids, never to other rows sharing
+/// the payee.
 pub fn categorize_txns(
     store: &Store,
     transport: &dyn Transport,
     ids: &[String],
+    force: bool,
 ) -> Result<AiRunReport, Error> {
     let wanted: HashSet<&str> = ids.iter().map(String::as_str).collect();
     let rows = store
-        .list_ai_candidates(true)?
+        .list_ai_candidates(force)?
         .into_iter()
         .filter(|(id, _, _)| wanted.contains(id.as_str()))
         .collect();
-    categorize_rows(store, transport, rows)
+    categorize_rows(store, transport, rows, force)
 }
 
 /// Settings, provider, and option list the pass needs, or a user-facing error when any of
@@ -111,11 +129,14 @@ pub(super) fn ai_context(
     Ok((settings, categorizer, options))
 }
 
-/// Shared body of the two entry points. `rows` are (id, payee, amount_cents) candidates.
+/// Shared body of the entry points. `rows` are (id, payee, amount_cents) candidates. `fresh`
+/// ignores cached answers and asks the provider for every payee; the new answer replaces the
+/// cached one.
 fn categorize_rows(
     store: &Store,
     transport: &dyn Transport,
     rows: Vec<(String, String, i64)>,
+    fresh: bool,
 ) -> Result<AiRunReport, Error> {
     let (settings, categorizer, options) = ai_context(store)?;
     let provider_id = settings.provider.as_deref().unwrap_or_default();
@@ -135,14 +156,17 @@ fn categorize_rows(
     }
 
     let mut report = AiRunReport::default();
+    // (row id, payee, category id) of the last row that got a category.
+    let mut last: Option<(String, String, String)> = None;
     for (key, (title, amount, ids)) in groups {
         report.payees += 1;
-        let answer = match store.ai_answer(&key)? {
+        let cached = if fresh { None } else { store.ai_answer(&key)? };
+        let answer = match cached {
             Some(cached) => cached,
             None => {
                 report.asked += 1;
                 let input = CategorizeInput {
-                    title,
+                    title: title.clone(),
                     direction: Direction::from_amount(amount),
                 };
                 // Record the round trip so Activity's debug view can show exactly what was
@@ -156,10 +180,11 @@ fn categorize_rows(
                             &key,
                             guess.category_id.as_deref(),
                             guess.confidence,
+                            guess.probability,
                             provider_id,
                             &exchanges,
                         )?;
-                        (guess.category_id, guess.confidence)
+                        (guess.category_id, guess.confidence, guess.probability)
                     }
                     Err(e) => {
                         // Keep the failed round trip for the trace and flag the rows so the
@@ -175,10 +200,31 @@ fn categorize_rows(
         };
         store.clear_ai_failed(&ids)?;
         match answer {
-            (Some(cat), confidence) if confidence >= settings.threshold => {
-                report.categorized += store.apply_ai_category(&ids, &cat)?;
+            (Some(cat), confidence, probability) if settings.accepts(confidence, probability) => {
+                for id in &ids {
+                    let n = store.apply_ai_category(std::slice::from_ref(id), &cat)?;
+                    if n > 0 {
+                        report.categorized += n;
+                        last = Some((id.clone(), title.clone(), cat.clone()));
+                    }
+                }
             }
             _ => report.below_threshold += 1,
+        }
+    }
+    if report.categorized == 1 {
+        if let Some((txn_id, payee, cat_id)) = last {
+            let category = store
+                .list_categories()?
+                .into_iter()
+                .find(|c| c.id == cat_id)
+                .map(|c| c.label())
+                .unwrap_or(cat_id);
+            report.single = Some(SingleResult {
+                txn_id,
+                payee,
+                category,
+            });
         }
     }
     store.persist()?;
@@ -186,7 +232,7 @@ fn categorize_rows(
 }
 
 /// The after-sync hook. `None` when the toggle is off or nothing is configured. Rows whose
-/// last attempt failed are left alone; only "Ask AI" or the Setup → AI button retry them.
+/// last attempt failed are left alone; only "Ask AI" or an AI settings change retries them.
 pub fn run_after_sync(
     store: &Store,
     transport: &dyn Transport,
@@ -196,13 +242,13 @@ pub fn run_after_sync(
         return Ok(None);
     }
     let rows = store.list_ai_candidates(false)?;
-    categorize_rows(store, transport, rows).map(Some)
+    categorize_rows(store, transport, rows, false).map(Some)
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::ai::{AiSecret, AiSettings};
+    use crate::ai::{AiSecret, AiSettings, ScoreCombine};
     use crate::providers::{
         AccountSet, ConnectionSecrets, NormalizedAccount, NormalizedTxn, ScriptedTransport,
         TransportResponse,
@@ -295,6 +341,31 @@ mod tests {
     }
 
     #[test]
+    fn a_single_categorized_row_is_named_in_the_report() {
+        let (_d, s) = store();
+        let food = s.add_category("Food").unwrap();
+        s.add_subcategory(&food, "Dining").unwrap();
+        configure(&s, 0.5, false);
+        let ids = seed(&s, &[("BLUE BOTTLE", -600)]);
+        let t = ScriptedTransport::new(vec![ok("Food › Dining", 0.9)]);
+        let r = categorize_txns(&s, &t, &ids, true).unwrap();
+        assert_eq!(r.categorized, 1);
+        let one = r.single.clone().expect("single result");
+        assert_eq!(one.txn_id, ids[0]);
+        assert_eq!(one.payee, "BLUE BOTTLE");
+        assert_eq!(one.category, "Food › Dining");
+        assert_eq!(r.summary(), "AI categorized BLUE BOTTLE as Food › Dining.");
+
+        // Two rows is a count again, with no single result.
+        let ids = seed(&s, &[("SHAKE SHACK", -900), ("SHAKE SHACK", -1200)]);
+        let t = ScriptedTransport::new(vec![ok("Food", 0.9)]);
+        let r = categorize_txns(&s, &t, &ids, true).unwrap();
+        assert_eq!(r.categorized, 2);
+        assert!(r.single.is_none());
+        assert!(r.summary().starts_with("AI categorized 2 rows"));
+    }
+
+    #[test]
     fn unconfigured_is_a_user_error() {
         let (_d, s) = store();
         s.add_category("Food").unwrap();
@@ -366,7 +437,7 @@ mod tests {
         assert_eq!(categorized_by(&s, &ids[2]).as_deref(), Some("ai"));
         assert_eq!(
             r2.summary(),
-            "AI categorized 1 row across 2 payees, 1 below threshold."
+            "AI categorized SHELL OIL as Gas, 1 below threshold."
         );
     }
 
@@ -440,7 +511,7 @@ mod tests {
             )
             .unwrap();
         let t2 = ScriptedTransport::new(vec![ok("Food", 0.93)]);
-        categorize_txns(&s, &t2, std::slice::from_ref(&ids[0])).unwrap();
+        categorize_txns(&s, &t2, std::slice::from_ref(&ids[0]), false).unwrap();
         assert_eq!(t2.calls(), 1);
         assert_eq!(
             s.ai_record_for(&ids[0]).unwrap().unwrap().exchanges.len(),
@@ -596,7 +667,7 @@ mod tests {
 
         // "Ask AI" on one row retries it and clears its flag; the sibling stays flagged.
         let t3 = ScriptedTransport::new(vec![ok("Food", 0.9)]);
-        let r3 = categorize_txns(&s, &t3, std::slice::from_ref(&ids[0])).unwrap();
+        let r3 = categorize_txns(&s, &t3, std::slice::from_ref(&ids[0]), true).unwrap();
         assert_eq!(t3.calls(), 1);
         assert_eq!(r3.categorized, 1);
         assert!(ai_failed_at(&s, &ids[0]).is_none());
@@ -605,12 +676,14 @@ mod tests {
         assert!(rec.error.is_none());
         assert_eq!(rec.category_name.as_deref(), Some("Food"));
 
-        // The Setup → AI button retries every flagged row; the cached answer applies.
+        // Mass runs (Setup → AI button, on-screen bulk) leave the flagged sibling alone.
         let t4 = ScriptedTransport::new(vec![]);
         let r4 = categorize_uncategorized(&s, &t4).unwrap();
         assert_eq!(t4.calls(), 0);
-        assert_eq!(r4.categorized, 1);
-        assert!(ai_failed_at(&s, &ids[1]).is_none());
+        assert_eq!(r4.payees, 0);
+        let r5 = categorize_txns(&s, &t4, std::slice::from_ref(&ids[1]), false).unwrap();
+        assert_eq!(r5.payees, 0);
+        assert!(ai_failed_at(&s, &ids[1]).is_some());
     }
 
     #[test]
@@ -740,7 +813,7 @@ mod tests {
         // One row asked for: one call, one row categorized. The sibling COSTCO row and SHELL
         // stay untouched even though the payee answer is now cached.
         let t = ScriptedTransport::new(vec![ok("Food", 0.95)]);
-        let r = categorize_txns(&s, &t, std::slice::from_ref(&ids[0])).unwrap();
+        let r = categorize_txns(&s, &t, std::slice::from_ref(&ids[0]), true).unwrap();
         assert_eq!(t.calls(), 1);
         assert_eq!(r.payees, 1);
         assert_eq!(r.categorized, 1);
@@ -766,18 +839,165 @@ mod tests {
         )
         .unwrap();
         let t = ScriptedTransport::new(vec![]);
-        let r = categorize_txns(&s, &t, std::slice::from_ref(&ids[0])).unwrap();
+        let r = categorize_txns(&s, &t, std::slice::from_ref(&ids[0]), true).unwrap();
         assert_eq!(t.calls(), 0);
         assert_eq!(r.payees, 0);
         assert_eq!(categorized_by(&s, &ids[0]).as_deref(), Some("user"));
         // A cached answer for the payee applies to the other row without a call.
-        s.remember_ai_answer("costco whse", Some(&food), 0.9, "typesafe", &[])
+        s.remember_ai_answer("costco whse", Some(&food), 0.9, 0.0, "typesafe", &[])
             .unwrap();
-        let r = categorize_txns(&s, &t, &ids).unwrap();
+        let r = categorize_txns(&s, &t, &ids, false).unwrap();
         assert_eq!(t.calls(), 0);
         assert_eq!(r.payees, 1);
         assert_eq!(r.asked, 0);
         assert_eq!(r.categorized, 1);
         assert_eq!(categorized_by(&s, &ids[1]).as_deref(), Some("ai"));
+    }
+
+    #[test]
+    fn ask_ai_always_calls_the_provider_but_mass_runs_use_the_cache() {
+        let (_d, s) = store();
+        s.add_category("Food").unwrap();
+        configure(&s, 0.70, false);
+        let ids = seed(&s, &[("AAA MARKET", -100)]);
+        // A below-threshold answer is cached and the row stays uncategorized.
+        let t = ScriptedTransport::new(vec![ok("Food", 0.4)]);
+        let r = categorize_uncategorized(&s, &t).unwrap();
+        assert_eq!(r.below_threshold, 1);
+        assert_eq!(categorized_by(&s, &ids[0]), None);
+
+        // Mass runs reuse it without a call.
+        let t2 = ScriptedTransport::new(vec![]);
+        categorize_uncategorized(&s, &t2).unwrap();
+        categorize_txns(&s, &t2, &ids, false).unwrap();
+        assert!(run_after_sync(&s, &t2).unwrap().is_none());
+        assert_eq!(t2.calls(), 0);
+
+        // "Ask AI" asks again and the new answer replaces the cached one.
+        let t3 = ScriptedTransport::new(vec![ok("Food", 0.9)]);
+        let r3 = categorize_txns(&s, &t3, &ids, true).unwrap();
+        assert_eq!(t3.calls(), 1);
+        assert_eq!(r3.asked, 1);
+        assert_eq!(r3.categorized, 1);
+        assert_eq!(s.ai_answer("aaa market").unwrap().unwrap().1, 0.9);
+    }
+
+    /// A 200 answer that also carries per-choice probabilities.
+    fn ok_scored(choice: &str, confidence: f64, probability: f64) -> TransportResponse {
+        TransportResponse {
+            status: 200,
+            body: format!(
+                r#"{{"answers":{{"category":{{"type":"choice","choice":"{choice}","probabilities":{{"{choice}":{probability},"other":0.05}},"confidence":{confidence}}}}}}}"#
+            )
+            .into_bytes(),
+        }
+    }
+
+    #[test]
+    fn probability_gate_with_or_and_and() {
+        let (_d, s) = store();
+        s.add_category("Shopping").unwrap();
+        s.set_ai_settings(&AiSettings {
+            provider: Some("typesafe".into()),
+            api_key: AiSecret("k".into()),
+            use_confidence: true,
+            threshold: 0.70,
+            use_probability: true,
+            probability_threshold: 0.30,
+            combine: ScoreCombine::All,
+            ..Default::default()
+        })
+        .unwrap();
+        let ids = seed(&s, &[("TARGET 123", -2500)]);
+
+        // 40% confidence, 35% probability: AND needs both, so the row stays put.
+        let t = ScriptedTransport::new(vec![ok_scored("Shopping", 0.40, 0.35)]);
+        let r = categorize_uncategorized(&s, &t).unwrap();
+        assert_eq!(r.below_threshold, 1);
+        assert_eq!(categorized_by(&s, &ids[0]), None);
+        let (_, conf, prob) = s
+            .ai_answer(&normalize_payee("TARGET 123"))
+            .unwrap()
+            .unwrap();
+        assert!((conf - 0.40).abs() < 1e-9);
+        assert!((prob - 0.35).abs() < 1e-9);
+
+        // Switching to OR re-judges the cached answer without a call, and it applies.
+        s.set_ai_settings(&AiSettings {
+            combine: ScoreCombine::Any,
+            ..s.ai_settings().unwrap()
+        })
+        .unwrap();
+        let t2 = ScriptedTransport::new(vec![]);
+        let r2 = categorize_uncategorized(&s, &t2).unwrap();
+        assert_eq!(t2.calls(), 0);
+        assert_eq!(r2.categorized, 1);
+        assert_eq!(categorized_by(&s, &ids[0]).as_deref(), Some("ai"));
+    }
+
+    #[test]
+    fn probability_only_ignores_confidence() {
+        let (_d, s) = store();
+        s.add_category("Shopping").unwrap();
+        s.set_ai_settings(&AiSettings {
+            provider: Some("typesafe".into()),
+            api_key: AiSecret("k".into()),
+            use_confidence: false,
+            use_probability: true,
+            probability_threshold: 0.50,
+            ..Default::default()
+        })
+        .unwrap();
+        let ids = seed(&s, &[("AAA MARKET", -100), ("BBB SHOP", -200)]);
+        // aaa: high confidence, low probability. bbb: low confidence, high probability.
+        let t = ScriptedTransport::new(vec![
+            ok_scored("Shopping", 0.99, 0.10),
+            ok_scored("Shopping", 0.10, 0.60),
+        ]);
+        let r = categorize_uncategorized(&s, &t).unwrap();
+        assert_eq!(r.categorized, 1);
+        assert_eq!(categorized_by(&s, &ids[0]), None);
+        assert_eq!(categorized_by(&s, &ids[1]).as_deref(), Some("ai"));
+    }
+
+    #[test]
+    fn changing_the_ai_resets_tried_uncategorized_rows() {
+        let (_d, s) = store();
+        let food = s.add_category("Food").unwrap();
+        configure(&s, 0.70, true);
+        let ids = seed(
+            &s,
+            &[
+                ("AAA MARKET", -100),
+                ("BBB DINER", -200),
+                ("CCC CAFE", -300),
+            ],
+        );
+        s.remember_ai_answer("aaa market", Some(&food), 0.4, 0.0, "typesafe", &[])
+            .unwrap();
+        s.remember_ai_answer("ccc cafe", Some(&food), 0.9, 0.0, "typesafe", &[])
+            .unwrap();
+        s.apply_ai_category(std::slice::from_ref(&ids[2]), &food)
+            .unwrap();
+        s.mark_ai_failed(std::slice::from_ref(&ids[1])).unwrap();
+
+        // Score gates and the after-sync toggle are not "the AI": nothing resets.
+        let mut settings = s.ai_settings().unwrap();
+        settings.threshold = 0.5;
+        settings.use_probability = true;
+        settings.probability_threshold = 0.2;
+        settings.combine = ScoreCombine::All;
+        settings.after_sync = false;
+        s.set_ai_settings(&settings).unwrap();
+        assert!(s.ai_answer("aaa market").unwrap().is_some());
+        assert!(ai_failed_at(&s, &ids[1]).is_some());
+
+        // A new model clears the flag and the uncategorized payee's answer, but keeps the
+        // answer behind a categorized row.
+        settings.model = Some("other-model".into());
+        s.set_ai_settings(&settings).unwrap();
+        assert!(s.ai_answer("aaa market").unwrap().is_none());
+        assert!(ai_failed_at(&s, &ids[1]).is_none());
+        assert!(s.ai_answer("ccc cafe").unwrap().is_some());
     }
 }

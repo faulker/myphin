@@ -13,4 +13,5 @@ watch_path = ["src", "assets"]
 
 [bundle]
 identifier = "me.faulk.myphin"
+publisher = "Winter Faulk"
 icon = ["assets/icon.icns", "assets/icon.png"]

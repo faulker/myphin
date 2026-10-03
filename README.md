@@ -81,10 +81,11 @@ Go to Categories & Rules and add a few categories. Then head to Activity, pick t
 
 Myphin can send rows that no rule or remembered payee covers to an AI model. It picks a category using your category descriptions and only applies it when it's confident enough (70% by default, adjustable).
 
-You have two options, both set up in Setup → AI:
+You have three options, all set up in Setup → AI:
 
 - **[typesafe.ai](https://typesafe.ai)**, a hosted service. Paste your API key.
 - **A model you run yourself** with [lmr-rs](https://github.com/faulker/lmr-rs), on this machine or elsewhere on your network. No API key needed. [openbmb/MiniCPM5-2B-GGUF](https://huggingface.co/openbmb/MiniCPM5-2B-GGUF) gives the best local results (`lmr-rs models download minicpm5-2b`, then `lmr-rs serve`). A Metal build (`--features metal`) is much faster than CPU on a Mac.
+- **Any System One API.** Any server with a `/v1/systemone` endpoint, such as [Ollaya](https://ollaya.dev) running `winnow:e4b` or `laya:e4b`, or typesafe.ai itself with model `jev-latest`. Enter the server URL and model name; the key and certificate are optional.
 
 Only the payee name and whether money went in or out are ever sent. Rows the AI categorized get an `ai` tag, and the AI chip in Activity lists them so you can double-check. To see exactly what goes over the wire, use "Debug a transaction" in Setup → AI.
 
@@ -121,11 +122,10 @@ Setup → Passphrase re-encrypts the ledger. Myphin keeps `ledger.enc.backup` un
 ### Build
 
 ```bash
-dx bundle --desktop     # release bundle (.app on macOS)
-cargo build --release
+scripts/build-macos.sh  # release Myphin.app in dist/, signed ad-hoc
 ```
 
-`cargo run` also works, but styles only load through `dx`, so use `dx serve --desktop` for day-to-day work.
+The script wraps `dx bundle --desktop --release --package-types macos`. Plain `cargo build --release` and `cargo run` produce a binary without styles, because assets only load through `dx`. Use `dx serve --desktop` for day-to-day work.
 
 ### Test
 
@@ -141,7 +141,7 @@ Setup → Debug adds two buttons to each row's editor in Activity: **Raw data** 
 ### Project layout
 
 - `src/providers`: `TransactionSource` trait, SimpleFIN, and the `Transport` HTTP abstraction
-- `src/ai`: `Categorizer` trait, shared wire code, typesafe.ai and lmr-rs providers, the AI pass
+- `src/ai`: `Categorizer` trait, shared wire code, typesafe.ai, generic System One, and lmr-rs providers, the AI pass
 - `src/sync`: windowed fetch, importer, dedup
 - `src/store`: encrypted SQLite
 - `src/domain`: categories, caps, rules, splits

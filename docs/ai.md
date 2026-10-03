@@ -12,11 +12,14 @@ the `ai` tag. AI answers never seed payee memory (only user categorizations do).
 
 ## Entry points
 
-`categorize_uncategorized` runs every candidate row (Setup → AI button). `run_after_sync`
-does the same when the toggle is on, minus rows flagged as failed (below). `categorize_txns(ids)`
-limits the pass to given ids: Activity's "Ask AI" on one row and "Categorize N with AI" for the
-rows on screen. Non-candidate ids are skipped, and answers apply only to the given ids, never to
-other rows sharing the payee (those pick the cached answer up on the next full run).
+`categorize_uncategorized` runs every candidate row not flagged as failed (Setup → AI button).
+`run_after_sync` does the same when the toggle is on. `categorize_txns(ids, force)` limits the
+pass to given ids. Activity's "Categorize N with AI" for the rows on screen passes
+`force = false`, so it behaves like the other mass runs: cached answers are used and failed rows
+are skipped. "Ask AI" on one row passes `force = true`: the row is retried even if it failed, and
+the provider is always called, even when the payee has a cached answer (the new answer replaces
+it). Non-candidate ids are skipped, and answers apply only to the given ids, never to other rows
+sharing the payee (those pick the cached answer up on the next full run).
 
 ## Failures
 
@@ -24,9 +27,10 @@ When the provider call for a payee errors, the run stops (progress so far is kep
 things are written. `ai_answers` gets a row for the payee with `error` set and the recorded
 exchanges, so Activity's "AI trace" shows the request and what came back. `ai_answer()` ignores
 such rows, so the payee is asked again next time. Each transaction in the group gets
-`ai_failed_at`, which the after-sync pass and Activity's on-screen bulk button skip. Only two
-things retry a flagged row: "Ask AI" on that row, and Setup → AI → "Categorize with AI". A
-successful answer for the payee clears the flag on the rows it covered.
+`ai_failed_at`, which every mass run (after-sync, Setup → AI → "Categorize with AI", and
+Activity's on-screen bulk button) skips. Only two things retry a flagged row: "Ask AI" on that
+row, or changing the AI in Setup (below). A successful answer for the payee clears the flag on
+the rows it covered.
 
 ## What is sent
 
@@ -40,26 +44,46 @@ them). Unticking a parent also unticks its sub-categories, so a child drops off 
 list too and cannot be turned back on until its parent is. If every category is off,
 the pass errors until one is turned back on.
 
-## Threshold and cache
+## Score gates and cache
 
-Settings (`Store::ai_settings`) live in the ledger's `meta` table: provider id, API key,
-threshold (0..1, default 0.70), the run-after-sync toggle, and for a self-hosted provider the
-server URL (`ai_endpoint`) and an optional trusted certificate (`ai_ca_cert`, PEM). The key,
+An answer is applied only when it passes the score gates (`AiSettings::accepts`). Each System
+One answer has two scores: `confidence` (how sure the model is of its pick) and the pick's
+entry in `probabilities` (`CategoryGuess::probability`, 0 when the response has none). Each
+gate can be turned on or off with its own threshold. With one on, only that gate counts. With
+both on, `combine` decides: `Any` (OR, either passes) or `All` (AND, both pass). With neither
+on, nothing is applied (Setup refuses to save that). The applied category is always the
+model's pick. Example: confidence 70% OR probability 30%, an answer at 40% confidence with
+the pick at 35% is applied; with AND it is not.
+
+Settings (`Store::ai_settings`) live in the ledger's `meta` table: provider id, API key, the
+confidence gate (`ai_use_confidence`, default on; `ai_threshold`, 0..1, default 0.70), the
+probability gate (`ai_use_probability`, default off; `ai_probability_threshold`, default
+0.30), how they combine (`ai_combine`, `or` or `and`, default `or`), the run-after-sync toggle, for a self-hosted provider the
+server URL (`ai_endpoint`) and an optional trusted certificate (`ai_ca_cert`, PEM), and for a
+provider with a `default_model()` the model name (`ai_model`). The key,
 URL, and certificate are encrypted at rest with the rest of the ledger, like SimpleFIN Access
 URLs, and the key never appears in logs or messages. A provider whose
-`Categorizer::needs_key()` is `false` (currently only LMR) is considered configured with no
+`Categorizer::needs_key()` is `false` (LMR and Any System One API) is considered configured with no
 key at all; `AiSettings::is_configured()` is what Setup and `run_after_sync` check.
 
 `ai_answers` caches one answer per `normalize_payee` key, including "other" and
-below-threshold answers, so a payee is asked once. Each answer also keeps the round trips that
+answers that missed the gates, so a payee is asked once. Each answer also keeps the round trips that
 produced it (`exchanges`: a JSON array of `AiExchange`, recorded through `RecordingTransport`,
 so headers and the key are never stored; an answer saved before exchanges were kept has
 `exchanges IS NULL` and does not count as cached, so that payee is asked once more).
 `Store::ai_record_for(txn_id)` reads the answer and
-trail back for a row's payee; Activity shows it under "AI trace" when Setup → Debug is on. Lowering the threshold re-applies cached
-answers without network calls. Any category add, rename, re-parent, description change,
+trail back for a row's payee; Activity shows it under "AI trace" when Setup → Debug is on. The cache keeps the pick's probability
+(`probability`; schema 11 backfilled it from each answer's recorded response). Loosening the
+gates re-applies cached answers without network calls, and changing them never resets tried
+rows. Any category add, rename, re-parent, description change,
 Send to AI toggle, or delete clears the cache because the option list the model saw changed.
 The in-budget flag does not, since it changes nothing the model sees.
+
+Saving Setup → AI with a different provider, key, server URL, certificate, or model calls
+`Store::reset_ai_attempts`: every uncategorized row loses its `ai_failed_at` flag and the
+cached answers for those rows' payees are dropped, so the next run (after-sync or bulk) asks
+the new AI. Answers behind categorized rows are kept. Threshold and the after-sync toggle do
+not count as a change.
 
 ## Debug trace
 
@@ -89,6 +113,7 @@ pub trait Categorizer: Send + Sync {
     fn warning(&self) -> Option<&'static str> { None }  // gold caveat under the description
     fn link(&self) -> Option<(&'static str, &'static str)> { None }  // (text, URL) after it
     fn default_endpoint(&self) -> Option<&'static str> { None }      // Some = self-hosted
+    fn default_model(&self) -> Option<&'static str> { None }         // Some = Setup shows Model
     fn categorize(&self, settings: &AiSettings, input: &CategorizeInput,
                   options: &[CategoryOption], transport: &dyn Transport)
         -> Result<CategoryGuess, Error>;
@@ -108,6 +133,8 @@ Rules for an implementation:
 - `settings` carries the key plus, for a provider with a `default_endpoint()`, the saved
   server URL (`AiSettings::endpoint_or(default)`) and certificate (`ca_cert_pem()`). Setup
   shows the URL and certificate fields only for such providers and validates both on Save.
+  Likewise a provider with a `default_model()` gets the saved model name through
+  `AiSettings::model_or(default)`, and Setup shows the Model field only for it.
 - Return `CategoryGuess { category_id: None, .. }` for "nothing fits". Confidence is 0..1.
 - Errors are `Error::user(..)` with text safe to show; never include the key or the URL.
   Sanitize any provider text with `sanitize_user_text`.
@@ -116,11 +143,13 @@ Rules for an implementation:
   (e.g. it only listens on loopback); `AiSettings::is_configured()` then treats an empty key
   as configured for that provider.
 
-Two providers speak the same System One wire protocol (request/response shapes, retry loop,
-error mapping), factored into `ai::systemone::post_systemone(endpoint, key, root_cert_pem,
-timeout, input, options, transport, unreachable_msg, timeout_msg)`. A new provider against
-that same protocol should call it rather than reimplement the wire format;
-`src/ai/typesafe.rs` and `src/ai/lmr.rs` are both thin wrappers around it.
+Three providers speak the same System One wire protocol (request/response shapes, retry loop,
+error mapping), factored into `ai::systemone::post_systemone(endpoint, model, key,
+root_cert_pem, timeout, input, options, transport, unreachable_msg, timeout_msg)`. typesafe.ai
+and LMR send `systemone::DEFAULT_MODEL` (`jev-latest`). Before adding another provider for a
+System One server, check whether "Any System One API" already covers it; if it needs its own
+entry, call `post_systemone` rather than reimplement the wire format. `src/ai/typesafe.rs`,
+`src/ai/lmr.rs`, and `src/ai/systemone_any.rs` are all thin wrappers around it.
 
 `src/ai/typesafe.rs` is the reference: `POST https://api.typesafe.ai/v1/systemone`, bearer
 auth, one `choice` question whose criteria are the categories, answer read from
@@ -186,3 +215,29 @@ you want that much faster.
 `tests/live_lmr.rs` drives the real provider through `ReqwestTransport` against a running
 server: `cargo test -- --ignored live_lmr`. Set `LMR_URL`, `LMR_KEY`, and `LMR_CERT` (path
 to the server's `cert.pem`) to point it at a self-hosted TLS server.
+
+## Any System One API
+
+`ai::SystemOne` (`src/ai/systemone_any.rs`, provider id `systemone`, shown as "Any System One
+API") works with any server that serves `POST <base>/v1/systemone` with typesafe.ai's request
+and response shapes. Setup shows four fields:
+
+- Server URL: blank means `http://127.0.0.1:11435` (Ollaya's default). The provider appends
+  `/v1/systemone`, and a URL pasted with that path already on it is not doubled. The same
+  `url_allowed` rule applies: https anywhere, http only on a local network address.
+- Model: sent in the request's `model` field. Blank means `winnow:e4b`. Use `laya:e4b` on
+  [Ollaya](https://ollaya.dev) for the closest match to Jev, or `jev-latest` against
+  `https://api.typesafe.ai`. lmr-rs ignores the field.
+- API key: optional, sent as a bearer token. typesafe.ai needs one; Ollaya accepts any key
+  unless the server sets `OLLAYA_API_KEY`.
+- Server certificate: optional PEM for a self-signed https server, as for LMR.
+
+It waits up to three minutes per request, like LMR, since the server may be a CPU-only model.
+
+### Ollaya quick start
+
+Install Ollaya from [ollaya.dev/download](https://ollaya.dev/download), pull a model, and start
+its server so it listens on `127.0.0.1:11435`. See the
+[Ollaya TypeSafe compatibility guide](https://ollaya.dev/docs/typesafe-compatibility) for the
+exact commands. Then Setup → AI → "Any System One API", leave the URL blank, and set the model
+(`winnow:e4b` or `laya:e4b`).
