@@ -474,6 +474,8 @@ pub struct TxnQuery {
     pub month: Option<(i32, u32)>,
     /// Case-insensitive match on payee or notes. If it parses as an amount, matches that amount too.
     pub search: String,
+    /// Only the split lines of this parent. `None` lists top-level rows.
+    pub parent_id: Option<String>,
 }
 
 impl Store {
@@ -1058,9 +1060,16 @@ impl Store {
              JOIN accounts a ON a.id = t.account_id
              LEFT JOIN categories c ON c.id = t.category_id
              LEFT JOIN categories pc ON pc.id = c.parent_id
-             WHERE t.deleted=0 AND t.parent_id IS NULL ",
+             WHERE t.deleted=0 ",
         );
         let mut args: Vec<Box<dyn rusqlite::ToSql>> = Vec::new();
+        match &q.parent_id {
+            Some(pid) => {
+                args.push(Box::new(pid.clone()));
+                sql.push_str(&format!(" AND t.parent_id = ?{} ", args.len()));
+            }
+            None => sql.push_str(" AND t.parent_id IS NULL "),
+        }
         if q.uncategorized_only {
             sql.push_str(" AND t.category_id IS NULL AND t.excluded=0 AND t.is_income=0 AND t.transfer_peer_id IS NULL AND t.transfer_account_id IS NULL ");
         }
@@ -1082,7 +1091,7 @@ impl Store {
         if let Some(aid) = &q.account_id {
             args.push(Box::new(aid.clone()));
             sql.push_str(&format!(" AND t.account_id = ?{} ", args.len()));
-        } else {
+        } else if q.parent_id.is_none() {
             sql.push_str(" AND a.hidden=0 ");
         }
         if let Some((y, m)) = q.month {
@@ -1113,7 +1122,12 @@ impl Store {
             clause.push_str(") ");
             sql.push_str(&clause);
         }
-        sql.push_str(" ORDER BY COALESCE(t.user_posted_at, t.posted_at) DESC, t.id");
+        // Split lines share the parent's date; their remote ids keep the entered order.
+        if q.parent_id.is_some() {
+            sql.push_str(" ORDER BY t.remote_id");
+        } else {
+            sql.push_str(" ORDER BY COALESCE(t.user_posted_at, t.posted_at) DESC, t.id");
+        }
         let mut stmt = self.conn().prepare(&sql)?;
         let params: Vec<&dyn rusqlite::ToSql> = args.iter().map(|a| a.as_ref()).collect();
         let rows = stmt.query_map(params.as_slice(), |r| {
@@ -1261,6 +1275,14 @@ impl Store {
         };
         self.persist()?;
         Ok(extra)
+    }
+
+    /// The split lines under `parent_id`, in the order they were entered.
+    pub fn split_lines(&self, parent_id: &str) -> Result<Vec<Txn>, Error> {
+        self.query_transactions(&TxnQuery {
+            parent_id: Some(parent_id.to_string()),
+            ..Default::default()
+        })
     }
 
     pub fn split_transaction(
@@ -2079,6 +2101,35 @@ mod tests {
         .unwrap();
         assert_eq!(s.category_spent(&food, y, m).unwrap(), 2000);
         assert_eq!(s.category_spent(&gas, y, m).unwrap(), 1000);
+    }
+
+    #[test]
+    fn split_lines_list_under_parent_only() {
+        let (_d, s) = store();
+        let food = s.add_category("Food").unwrap();
+        let gas = s.add_category("Gas").unwrap();
+        let id = seed_txn(&s, -3000, "Costco", 1_790_000_000);
+        s.split_transaction(
+            &id,
+            &[(Some(food.clone()), -2000), (Some(gas.clone()), -1000)],
+        )
+        .unwrap();
+        let lines = s.split_lines(&id).unwrap();
+        let got: Vec<_> = lines
+            .iter()
+            .map(|t| (t.category_id.clone(), t.amount_cents, t.parent_id.clone()))
+            .collect();
+        assert_eq!(
+            got,
+            vec![
+                (Some(food), -2000, Some(id.clone())),
+                (Some(gas), -1000, Some(id.clone())),
+            ]
+        );
+        // The top-level list still shows only the parent, flagged as split.
+        let top = s.query_transactions(&TxnQuery::default()).unwrap();
+        assert_eq!(top.len(), 1);
+        assert!(top[0].has_splits);
     }
 
     #[test]

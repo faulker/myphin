@@ -121,6 +121,20 @@ fn mark_message(payee: &str, to: &str) -> String {
 }
 
 /// Which rows a keyboard command acts on: the selection if there is one, else the cursor row.
+/// What is left to split off `total` after the two typed amounts. Blank or unparsable
+/// amounts count as zero, so the line updates while the user types.
+fn split_left_message(total: i64, a: &str, b: &str) -> String {
+    let typed = |raw: &str| myphin::money::parse_cents(raw).unwrap_or(0);
+    let left = total - typed(a) - typed(b);
+    if left == 0 {
+        "Nothing left to split.".to_string()
+    } else if left.signum() != total.signum() && total != 0 {
+        format!("Over by ${}.", format_cents(left.abs()))
+    } else {
+        format!("Left to split: ${}", format_cents(left))
+    }
+}
+
 fn targets(selected: &[String], txns: &[Txn], cursor: usize) -> Vec<String> {
     if !selected.is_empty() {
         return selected.to_vec();
@@ -168,14 +182,22 @@ pub fn ActivityView(
     let mut anchor = use_signal(|| None::<(String, f64)>);
     let _tick = nonce();
 
-    let (txns, cats, accounts, months, ai_ready, debug, home) = match store() {
+    let (txns, split_lines, cats, accounts, months, ai_ready, debug, home) = match store() {
         Some(s) => {
             let g = s.lock().unwrap();
             let scope = g
                 .activity_scope()
                 .unwrap_or_else(|_| myphin::store::DEFAULT_ACTIVITY_SCOPE.to_string());
+            let txns = g.query_transactions(&filter()).unwrap_or_default();
+            // Each split parent's lines, shown under it in the list.
+            let split_lines: std::collections::HashMap<String, Vec<Txn>> = txns
+                .iter()
+                .filter(|t| t.has_splits)
+                .map(|t| (t.id.clone(), g.split_lines(&t.id).unwrap_or_default()))
+                .collect();
             (
-                g.query_transactions(&filter()).unwrap_or_default(),
+                txns,
+                split_lines,
                 g.list_categories().unwrap_or_default(),
                 g.list_accounts().unwrap_or_default(),
                 g.list_months().unwrap_or_default(),
@@ -908,7 +930,8 @@ pub fn ActivityView(
                                     }
                                 }
                                 span { class: "acct", "{t.account_name}" }
-                                if cats.is_empty() {
+                                // A split parent's category lives on its lines below.
+                                if cats.is_empty() || t.has_splits {
                                     span { class: "cat", "-" }
                                 } else {
                                     CategoryPicker {
@@ -930,6 +953,39 @@ pub fn ActivityView(
                                         "+"
                                     }
                                     "${format_cents(t.amount_cents.abs())}"
+                                }
+                            }
+                            for line in split_lines.get(&t.id).into_iter().flatten() {
+                                div { key: "{line.id}", class: "txn-main txn-split",
+                                    span {}
+                                    span {}
+                                    span { class: "payee",
+                                        span { class: "payee-name", "↳ {line.payee}" }
+                                    }
+                                    span {}
+                                    if cats.is_empty() {
+                                        span { class: "cat", "-" }
+                                    } else {
+                                        CategoryPicker {
+                                            store,
+                                            status,
+                                            nonce,
+                                            ids: vec![line.id.clone()],
+                                            cats: cats.clone(),
+                                            current_id: line.category_id.clone(),
+                                            class: "cat".to_string(),
+                                            prompt: None,
+                                            selection: None,
+                                        }
+                                    }
+                                    span { class: if line.amount_cents < 0 { "amt out" } else { "amt in" },
+                                        if line.amount_cents < 0 {
+                                            "−"
+                                        } else {
+                                            "+"
+                                        }
+                                        "${format_cents(line.amount_cents.abs())}"
+                                    }
                                 }
                             }
                             if expanded.read().as_deref() == Some(t.id.as_str()) {
@@ -1488,6 +1544,9 @@ fn RowEditor(
                             oninput: move |e| split_b.set(e.value()),
                         }
                     }
+                    p { class: "hint split-left",
+                        "{split_left_message(txn.amount_cents, &split_a.read(), &split_b.read())}"
+                    }
                     div { class: "row",
                         button {
                             class: "primary",
@@ -1801,6 +1860,15 @@ fn parse_iso(s: &str) -> Option<i64> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn split_left_tracks_typed_amounts() {
+        assert_eq!(split_left_message(-3000, "", ""), "Left to split: $-30.00");
+        assert_eq!(split_left_message(-3000, "-10.00", "abc"), "Left to split: $-20.00");
+        assert_eq!(split_left_message(-3000, "-10.00", "-20.00"), "Nothing left to split.");
+        assert_eq!(split_left_message(-3000, "-25.00", "-10.00"), "Over by $5.00.");
+        assert_eq!(split_left_message(5000, "60.00", ""), "Over by $10.00.");
+    }
 
     fn txn(id: &str) -> Txn {
         Txn {
